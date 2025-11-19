@@ -2,8 +2,8 @@
 
 set -ex
 
-# create conda
-yes '' | "${SHELL}" <(curl -L micro.mamba.pm/install.sh)
+# # create conda
+# yes '' | "${SHELL}" <(curl -L micro.mamba.pm/install.sh)
 source ~/.bashrc
 
 micromamba create -n slime python=3.12 pip -c conda-forge -y
@@ -38,11 +38,15 @@ TORCH_CUDA_ARCH_LIST="9.0;9.0a" NVCC_APPEND_FLAGS="--threads 4" \
   --no-build-isolation \
   --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" git+https://github.com/NVIDIA/apex.git
 # transformer engine
+
+# need to install nccl
+micromamba install -n slime -c conda-forge nccl -y
+
 TORCH_CUDA_ARCH_LIST="9.0;9.0a" \
-  pip -v install transformer_engine[pytorch]
+  pip -v install transformer_engine[pytorch] --no-build-isolation --no-cache-dir --no-binary=:all:
 # flash attn
 # the newest version megatron supports is v2.7.4.post1
-MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1
+MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir --no-binary=flash-attn
 # megatron
 cd $BASE_DIR
 git clone https://github.com/NVIDIA/Megatron-LM.git
@@ -63,7 +67,7 @@ if [ ! -d "$BASE_DIR/slime" ]; then
   export SLIME_DIR=$BASE_DIR/slime
   pip install -e .
 else
-  export SLIME_DIR=$BASE_DIR/
+  export SLIME_DIR=$BASE_DIR/slime
   pip install -e .
 fi
 

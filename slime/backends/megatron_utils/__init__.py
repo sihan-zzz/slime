@@ -1,3 +1,4 @@
+import importlib
 import logging
 
 import torch
@@ -21,11 +22,8 @@ except ImportError:
     logging.warning("deep_ep is not installed, some functionalities may be limited.")
 
 
-from .actor import MegatronTrainRayActor
 from .arguments import parse_args, set_default_megatron_args, validate_args
 from .checkpoint import load_checkpoint, save_checkpoint
-from .initialize import init
-from .model import initialize_model_and_optimizer
 
 logging.getLogger().setLevel(logging.WARNING)
 
@@ -40,3 +38,20 @@ __all__ = [
     "init",
     "initialize_model_and_optimizer",
 ]
+
+_LAZY_ATTRS = {
+    "init": ".initialize",
+    "initialize_model_and_optimizer": ".model",
+    "MegatronTrainRayActor": ".actor",
+}
+
+
+def __getattr__(name: str):
+    module_path = _LAZY_ATTRS.get(name)
+    if module_path is None:
+        raise AttributeError(f"module {__name__} has no attribute {name}")
+
+    module = importlib.import_module(module_path, __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
