@@ -6,8 +6,6 @@
 #SBATCH --gpus-per-node=8              # GPUs per node
 #SBATCH --cpus-per-task=16
 #SBATCH --account=cpt
-#SBATCH --output=%x-%j.out
-#SBATCH --error=%x-%j.err
 #
 # NOTE:
 # - Adjust nodes/gpus/cpus/time/partition to your GCP/Slurm cluster.
@@ -22,6 +20,25 @@ set -ex
 GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-8}}  # fallback if your cluster exposes env var differently
 PYTHON=python
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+SLIME_REPO_DIR="$(realpath "${SCRIPT_DIR}/../..")"
+WORKSPACE_DIR="$(realpath "${SLIME_REPO_DIR}/..")"
+DEFAULT_MEGATRON_REPO="${WORKSPACE_DIR}/Megatron-LM"
+MEGATRON_REPO_DIR="${MEGATRON_REPO_DIR:-${DEFAULT_MEGATRON_REPO}}"
+
+if [ ! -d "${MEGATRON_REPO_DIR}" ]; then
+  echo "ERROR: Could not locate Megatron-LM checkout at ${MEGATRON_REPO_DIR}. Set MEGATRON_REPO_DIR to override." >&2
+  exit 1
+fi
+
+PYTHONPATH_BASE="${MEGATRON_REPO_DIR}:${SLIME_REPO_DIR}:${SCRIPT_DIR}"
+if [ -n "${PYTHONPATH:-}" ]; then
+  PYTHONPATH_VALUE="${PYTHONPATH_BASE}:${PYTHONPATH}"
+else
+  PYTHONPATH_VALUE="${PYTHONPATH_BASE}"
+fi
+
+export CUDA_HOME=/usr/local/cuda-12.8
+export CPLUS_INCLUDE_PATH="$CUDA_HOME/include:${CPLUS_INCLUDE_PATH:-}"
 
 export LOG_DIR=/home/sihanzeng_meta_com/uv/logs
 export UNIQUE_JOB_NAME=${SLURM_JOB_NAME}_${SLURM_JOB_ID}
@@ -29,6 +46,14 @@ export LOG_PREFIX=${LOG_DIR}/${UNIQUE_JOB_NAME}_$(date +"%Y%m%d_%H%M%S")
 echo "Creating log directory at $LOG_PREFIX"
 mkdir -p "$LOG_PREFIX"
 exec > "$LOG_PREFIX/sbatch.out" 2>&1
+
+
+which python
+
+# torch.compile in PyTorch 2.4 + Triton 3.4 in this env hits a duplicate template bug.
+# Force Dynamo off so we fall back to eager mode unless explicitly overridden.
+: "${TORCHDYNAMO_DISABLE:=1}"
+export TORCHDYNAMO_DISABLE
 
 # load modules / conda if necessary (example)
 # module load cuda/12.1
@@ -66,15 +91,18 @@ export MASTER_ADDR
 export MASTER_PORT
 
 # common runtime env used for ray job submit (tweak PYTHONPATH)
-RUNTIME_ENV_JSON="{
-  \"env_vars\": {
-    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}:/root/slime\",
-    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"NCCL_NVLS_ENABLE\": \"0\",
-    \"NCCL_SHARP_DISABLE\": \"1\",
-    \"NCCL_DEBUG\": \"INFO\"
+RUNTIME_ENV_JSON=$(cat <<EOF
+{
+  "env_vars": {
+    "PYTHONPATH": "${PYTHONPATH_VALUE}",
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "NCCL_NVLS_ENABLE": "0",
+    "NCCL_SHARP_DISABLE": "1",
+    "NCCL_DEBUG": "INFO"
   }
-}"
+}
+EOF
+)
 
 #
 # Start Ray cluster inside the Slurm allocation
@@ -196,23 +224,30 @@ if [ "${SLURM_PROCID}" -eq 0 ]; then
   )
 
   # submit the same ray job as you had in containerized setup
-  ray job submit --address="http://${MASTER_ADDR}:8265" \
-     --runtime-env-json="${RUNTIME_ENV_JSON}" \
-     -- ${PYTHON} train.py \
-     --actor-num-nodes ${SLURM_NNODES} \
-     --actor-num-gpus-per-node ${GPUS_PER_NODE} \
-     --colocate \
-     "${MODEL_ARGS[@]}" \
-     "${CKPT_ARGS[@]}" \
-     "${ROLLOUT_ARGS[@]}" \
-     "${OPTIMIZER_ARGS[@]}" \
-     "${GRPO_ARGS[@]}" \
-     "${WANDB_ARGS[@]}" \
-     "${PERF_ARGS[@]}" \
-     "${EVAL_ARGS[@]}" \
-     "${SGLANG_ARGS[@]}" \
-     "${MISC_ARGS[@]}" \
-     "${CUSTOM_ARGS[@]}"
+  echo "Launching training directly on the head node (this will BLOCK the sbatch until finished)"
+  export PYTHONPATH="${PYTHONPATH_VALUE}"
+  ${PYTHON} train.py \
+    --actor-num-nodes ${SLURM_NNODES} \
+    --actor-num-gpus-per-node ${GPUS_PER_NODE} \
+    --colocate \
+    "${MODEL_ARGS[@]}" \
+    "${CKPT_ARGS[@]}" \
+    "${ROLLOUT_ARGS[@]}" \
+    "${OPTIMIZER_ARGS[@]}" \
+    "${GRPO_ARGS[@]}" \
+    "${WANDB_ARGS[@]}" \
+    "${PERF_ARGS[@]}" \
+    "${EVAL_ARGS[@]}" \
+    "${SGLANG_ARGS[@]}" \
+    "${MISC_ARGS[@]}" \
+    "${CUSTOM_ARGS[@]}" \
+  2>&1 | tee train.log
+
+  TRAIN_EXIT_CODE=${PIPESTATUS[0]:-0}
+  echo "train.py exited with code ${TRAIN_EXIT_CODE}"
+  # ray stop only after training completes
+  ray stop --force || true
+  exit ${TRAIN_EXIT_CODE}
 fi
 
 # ---------------------------
@@ -225,7 +260,7 @@ fi
 #
 # if you want to use torch.distributed rendezvous:
 #   export NCCL_DEBUG=INFO
-#   export PYTHONPATH="/root/Megatron-LM/:${SCRIPT_DIR}:/root/slime"
+#   export PYTHONPATH="${PYTHONPATH_VALUE}"
 #   # Run torchrun with c10d rendezvous on MASTER_ADDR:MASTER_PORT
 #   srun --nodes=${SLURM_NNODES} --ntasks=${SLURM_NNODES} --ntasks-per-node=1 --mpi=none \
 #     ${PYTHON} -m torch.distributed.run \
