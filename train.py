@@ -10,20 +10,23 @@ from slime.ray.placement_group import create_placement_groups, create_rollout_ma
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger
 from slime.utils.tracking_utils import init_tracking
+import logging
 
+logger = logging.getLogger(__name__)
 
 def train(args):
     configure_logger()
     # allocate the GPUs
     pgs = create_placement_groups(args)
     init_tracking(args)
-
     # create the rollout manager, with sglang engines inside.
     # need to initialize rollout manager first to calculate num_rollout
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
+    logger.info("zzzzlog created rollout manager")
 
     # create the actor and critic models
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
+    logger.info("zzzzlog created training models")
 
     if args.offload_rollout:
         ray.get(rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
@@ -65,11 +68,14 @@ def train(args):
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
+
+        logger.info(f"zzzzlog starting {rollout_id=}")
         # TODO extract the duplicated eval logic
         if args.eval_interval is not None and rollout_id == 0:
             ray.get(rollout_manager.eval.remote(rollout_id))
 
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
+        logger.info(f"zzzzlog {rollout_id=}, rollout data done")
 
         if args.offload_rollout:
             ray.get(rollout_manager.offload.remote())
@@ -81,6 +87,7 @@ def train(args):
             ray.get(critic_train_handle)
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+        logger.info(f"zzzzlog {rollout_id=}, async training done")
 
         if args.save_interval is not None and (
             (rollout_id + 1) % args.save_interval == 0
@@ -92,6 +99,7 @@ def train(args):
                 critic_model.save_model(rollout_id)
             if args.rollout_global_dataset:
                 ray.get(rollout_manager.save.remote(rollout_id))
+            logger.info(f"zzzzlog {rollout_id=}, cp caving done with freq {args.save_interval=}")
 
         if args.enable_weights_backuper:
             offload_train()
@@ -113,6 +121,7 @@ def train(args):
             or (num_rollout_per_epoch is not None and (rollout_id + 1) % num_rollout_per_epoch == 0)
         ):
             ray.get(rollout_manager.eval.remote(rollout_id))
+            logger.info(f"zzzzlog {rollout_id=}, eval done with freq {args.eval_interval=}")
 
     ray.get(rollout_manager.dispose.remote())
 

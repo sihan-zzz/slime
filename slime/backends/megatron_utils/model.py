@@ -121,9 +121,9 @@ def setup_model_and_optimizer(
     optimizer = get_megatron_optimizer(
         config,
         model,
-        no_wd_decay_cond,
-        scale_lr_cond,
-        lr_mult,
+        # no_wd_decay_cond,
+        # scale_lr_cond,
+        # lr_mult,
         use_gloo_process_groups=args.enable_gloo_process_groups,
     )
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
@@ -527,7 +527,7 @@ def train(
         num_microbatches (Sequence[int]): Microbatches per step in the rollout.
     """
     args = get_args()
-
+    logger.info("zzzzlog entering megatron train")
     for iterator in data_iterator:
         iterator.reset()
 
@@ -579,9 +579,10 @@ def train(
 
     num_steps_per_rollout = len(num_microbatches)
 
+    logger.info(f"zzzzlog before entering {num_steps_per_rollout=}")
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
-
+        logger.info(f"zzzzlog training {step_id=}")
         # Run training step.
         loss_dict, grad_norm = train_one_step(
             args,

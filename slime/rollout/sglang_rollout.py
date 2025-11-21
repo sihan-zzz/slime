@@ -401,6 +401,7 @@ async def generate_rollout_async(
     logger.info(
         f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {sample.label}, reward: {sample.reward}",
     )
+    logger.info(f"zzzzlog after rollout {len(data)}, {len(data[0])}")
 
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)
