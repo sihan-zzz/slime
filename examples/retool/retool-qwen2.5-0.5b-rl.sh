@@ -9,6 +9,9 @@ pkill -9 python
 sleep 3
 pkill -9 ray
 pkill -9 python
+pkill -9 redis
+
+set -ex
 
 set -ex
 
@@ -24,39 +27,38 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "/root/slime/scripts/models/qwen3-4B.sh"
+source "/root/workspace/slime/scripts/models/qwen2.5-0.5B.sh"
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/font-info/qwen3-4b-sft
-   --ref-load /root/font-info/qwen3-4b-sft_torch_dist
-   # --load /root/Qwen3-4B_slime/
-   --save /root/font-info/qwen3-4b-sft/qwen3-4b-sft-multi-turn/
-   --save-interval 20
-   --rotary-base 5000000
+   --hf-checkpoint /root/workspace/Qwen-weights/Qwen2.5-0.5B-weights
+   --ref-load /root/workspace/Qwen-weights/Qwen2.5-0.5B-torch-dist
+   --save /root/workspace/Qwen-weights/Qwen2.5-0.5B-iter
+   --save-interval 4
+   # --rotary-base 1000000
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
+   --prompt-data /root/workspace/synthetic-APPS-10.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
    --rollout-shuffle
    --reward-key score
-   --num-rollout 3000
-   --rollout-batch-size 32
+   --num-rollout 5
+   --rollout-batch-size 4
    --n-samples-per-prompt 8
    --rollout-max-response-len 8192
-   --rollout-temperature 0.8
+   --rollout-temperature 0.7
 
-   --global-batch-size 256
+   --global-batch-size 4
    --balance-data
 )
 
 EVAL_ARGS=(
-   --eval-interval 20
-   --eval-prompt-data aime  /root/aime-2024/aime-2024.jsonl
-   --n-samples-per-eval-prompt 16
-   --eval-max-response-len 16384
+   --eval-interval 1
+   --eval-prompt-data apps /root/workspace/synthetic-APPS-emh30.jsonl
+   --n-samples-per-eval-prompt 1
+   --eval-max-response-len 4096
    --eval-top-p 0.7
 )
 
@@ -74,7 +76,7 @@ PERF_ARGS=(
 
    # --micro-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 9216
+   --max-tokens-per-gpu 1024
 )
 
 GRPO_ARGS=(
@@ -87,6 +89,21 @@ GRPO_ARGS=(
    --eps-clip-high 0.28
 )
 
+PPO_ARGS=(
+    --advantage-estimator ppo
+    --eps-clip 0.2
+    --eps-clip-high 0.28
+    --gamma 0.99
+    --lambd 0.95
+    --normalize-advantages
+    --critic-lr 5e-6
+    --entropy-coef 0.01
+    --use-kl-loss
+    --kl-loss-coef 0.1
+    --kl-loss-type low_var_kl
+)
+
+
 OPTIMIZER_ARGS=(
    --optimizer adam
    --lr 1e-6
@@ -98,13 +115,13 @@ OPTIMIZER_ARGS=(
 
 WANDB_ARGS=(
    --use-wandb
-   --wandb-project slime-dapo
-   --wandb-group qwen3-4B-test-multi-turn
+   --wandb-project slime-qwen2.5
+   --wandb-group qwen2.5-0.5B-test-multi-turn
    --wandb-key ${WANDB_KEY}
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 2
+   --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.7
 )
 
@@ -120,13 +137,21 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   --custom-generate-function-path generate_with_retool.generate
-   --custom-rm-path generate_with_retool.reward_func
+   --custom-generate-function-path generate_with_code_execute.generate
+   --custom-rm-path generate_with_code_execute.reward_func
+   --save-eval-debug-rollout-data /root/workspace/logs/eval_{rollout_id}.pt
+   --exclude-truncated-samples
 )
+
+DEBUG_ARGS=(
+   --debug-rollout-only
+   --save-debug-rollout-data /root/workspace/logs/rollout_{rollout_id}.pt
+)
+
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 2 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
@@ -141,16 +166,19 @@ ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 4 \
+   --actor-num-gpus-per-node 2 \
    --colocate \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
-   ${OPTIMIZER_ARGS[@]} \
    ${GRPO_ARGS[@]} \
+   ${OPTIMIZER_ARGS[@]} \
+   ${DISTRIBUTED_ARGS[@]} \
    ${WANDB_ARGS[@]} \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
-   ${CUSTOM_ARGS[@]}
+   ${CUSTOM_ARGS[@]} 
+   # ${GRPO_ARGS[@]} \
+   # ${DEBUG_ARGS[@]}

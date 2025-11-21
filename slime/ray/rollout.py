@@ -5,6 +5,8 @@ import time
 from pathlib import Path
 from typing import List, Union
 
+    
+
 import numpy as np
 import ray
 import torch
@@ -32,6 +34,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+step_global=0
 
 
 @ray.remote
@@ -252,14 +255,14 @@ class RolloutManager:
         if samples[0].rollout_log_probs is not None:
             train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
 
-        if samples[0].rollout_routed_experts is not None:
-            train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
+        if non_truncated_samples[0].rollout_routed_experts is not None:
+            train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in non_truncated_samples]
 
-        if samples[0].train_metadata is not None:
-            train_data["metadata"] = [sample.train_metadata for sample in samples]
+        if non_truncated_samples[0].train_metadata is not None:
+            train_data["metadata"] = [sample.train_metadata for sample in non_truncated_samples]
 
-        if "teacher_log_probs" in samples[0].__dict__:
-            train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
+        if "teacher_log_probs" in non_truncated_samples[0].__dict__:
+            train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in non_truncated_samples]
 
         return train_data
 
@@ -463,6 +466,15 @@ def _log_eval_rollout_data(rollout_id, args, data):
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, samples), f"eval/{key}/")
+        log_dict[f"eval/{key}-acc"] = data[key]["accuracy"]
+        log_dict[f"eval/{key}-precision"] = data[key]["precision"]
+        log_dict[f"eval/{key}-recall"] = data[key]["recall"]
+        log_dict[f"eval/{key}-tnr"] = data[key]["tnr"]
+        log_dict[f"eval/{key}-f1"] = data[key]["f1"]
+        log_dict[f"eval/{key}-average_response_length"] = data[key]["average_response_length"]
+        log_dict[f"eval/{key}-average_tool_call_count"] = data[key]["average_tool_call_count"]
+        log_dict[f"eval/{key}-average_turn_finished"] = data[key]["average_turn_finished"]
+
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
@@ -494,6 +506,11 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     if args.rollout_num_gpus:
         log_dict["perf/tokens_per_gpu_per_sec"] = sum(response_lengths) / rollout_time / args.rollout_num_gpus
     log_dict["perf/longest_sample_tokens_per_sec"] = max(response_lengths) / rollout_time
+    # Add truncated samples ratio metric
+    truncated_samples = [sample for sample in samples if hasattr(sample, 'status') and sample.status == Sample.Status.TRUNCATED]
+    total_samples = len(samples)
+    truncated_ratio = len(truncated_samples) / total_samples if total_samples > 0 else 0.0
+    log_dict["debug/truncated_samples_ratio"] = truncated_ratio
     log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, samples), f"rollout/")
     logger.info(f"perf {rollout_id}: {log_dict}")
     step = compute_rollout_step(args, rollout_id)

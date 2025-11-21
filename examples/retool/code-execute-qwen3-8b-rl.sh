@@ -24,29 +24,33 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "/root/workspace/slime/scripts/models/qwen3-4B.sh"
+source "/root/workspace/slime/scripts/models/qwen3-8B.sh"
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/workspace/Qwen-weights/Qwen3-4B-weights
-   --ref-load /root/workspace/Qwen-weights/Qwen3-4B-torch-dist
+   --hf-checkpoint /root/workspace/Qwen-weights/Qwen3-8B-weights
+   --ref-load /root/workspace/Qwen-weights/Qwen3-8B-torch-dist
    # --load /root/Qwen3-4B_slime/
-   --save /root/workspace/qwen3-4b-sft/qwen3-4b-sft-multi-turn/
+   --save /root/workspace/qwen3-8b-rl-multi-turn/
    --save-interval 20
    --rotary-base 1000000
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/workspace/dapo-math-17k/dapo-math-17k.jsonl
+   --prompt-data /root/workspace/APPS-dataset/APPS-synthetic-train.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
    --rollout-shuffle
-   --rm-type deepscaler
+   --reward-key score
    --num-rollout 3000
    --rollout-batch-size 32
    --n-samples-per-prompt 8
    --rollout-max-response-len 8192
    --rollout-temperature 0.8
+
+   # Dynamic sampling with truncation filtering
+   --over-sampling-batch-size 48
+   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.filter_truncated_samples
 
    --global-batch-size 256
    --balance-data
@@ -54,17 +58,17 @@ ROLLOUT_ARGS=(
 
 EVAL_ARGS=(
    --eval-interval 20
-   --eval-prompt-data aime  /root/workspace/aime-2024/aime-2024.jsonl
-   --n-samples-per-eval-prompt 16
-   --eval-max-response-len 16384
+   --eval-prompt-data apps  /root/workspace/APPS-dataset/APPS-synthetic-test.jsonl
+   --n-samples-per-eval-prompt 4
+   --eval-max-response-len 4096
    --eval-top-p 0.7
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size 4
    --sequence-parallel
-   --pipeline-model-parallel-size 1
-   --context-parallel-size 2
+   --pipeline-model-parallel-size 2
+   --context-parallel-size 1
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
 
@@ -85,7 +89,6 @@ GRPO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
-   --use-tis
 )
 
 OPTIMIZER_ARGS=(
@@ -99,14 +102,14 @@ OPTIMIZER_ARGS=(
 
 WANDB_ARGS=(
    --use-wandb
-   --wandb-project slime-mis
-   --wandb-group qwen3-4B-mis
+   --wandb-project slime-dapo
+   --wandb-group qwen3-8B-test-multi-turn
    --wandb-key ${WANDB_KEY}
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.7
+   --rollout-num-gpus-per-engine 2
+   --sglang-mem-fraction-static 0.9
 )
 
 MISC_ARGS=(
@@ -121,8 +124,9 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   --custom-config-path examples/train_infer_mismatch_helper/mis.yaml
-   --custom-tis-function-path examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp
+   --custom-generate-function-path generate_with_code_execute.generate
+   --custom-rm-path generate_with_code_execute.reward_func
+   --rollout-health-check-timeout 45
 )
 
 # launch the master node of ray in container
@@ -140,7 +144,7 @@ ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-s
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/root/Megatron-LM/\",
+    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}:/root/slime\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"0\",
     \"NCCL_SHARP_DISABLE\": \"1\",
