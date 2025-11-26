@@ -24,59 +24,57 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "/root/workspace/slime/scripts/models/qwen3-8B.sh"
+WORK_DIR="/home/sihanzeng_meta_com/uv"
+MEGATRON_REPO_DIR="${WORK_DIR}/Megatron-LM"
+SLIME_DIR="${WORK_DIR}/slime"
+source "${SLIME_DIR}/scripts/models/qwen3-8B.sh"
+
+MOUNT_DIR="/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/slime"
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/workspace/Qwen-weights/Qwen3-8B-weights
-   --ref-load /root/workspace/Qwen-weights/Qwen3-8B-torch-dist
-   # --load /root/Qwen3-4B_slime/
-   --save /root/workspace/qwen3-8b-rl-multi-turn/
+   --hf-checkpoint ${MOUNT_DIR}/qwen3_8b
+   --ref-load ${MOUNT_DIR}/qwen3_8b_torch_dist
+   --save ${MOUNT_DIR}/qwen3-8b-rl-multi-turn/
    --save-interval 20
    --rotary-base 1000000
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/workspace/APPS-dataset/APPS-synthetic-train.jsonl
+   --prompt-data ${MOUNT_DIR}/data/APPS-dataset/APPS-synthetic-train.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
    --rollout-shuffle
    --reward-key score
    --num-rollout 3000
-   --rollout-batch-size 32
-   --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
-   --rollout-temperature 0.8
-
-   # Dynamic sampling with truncation filtering
-   --over-sampling-batch-size 48
-   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.filter_truncated_samples
-
-   --global-batch-size 256
+     --rollout-batch-size 32
+     --n-samples-per-prompt 8
+     --rollout-max-response-len 8192
+     --rollout-temperature 0.8
+     --over-sampling-batch-size 48
+     --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.filter_truncated_samples
+     --global-batch-size 256
    --balance-data
 )
 
 EVAL_ARGS=(
    --eval-interval 20
-   --eval-prompt-data apps  /root/workspace/APPS-dataset/APPS-synthetic-test.jsonl
+   --eval-prompt-data apps  ${MOUNT_DIR}/data/APPS-dataset/APPS-synthetic-test.jsonl
    --n-samples-per-eval-prompt 4
    --eval-max-response-len 4096
    --eval-top-p 0.7
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size 2
    --sequence-parallel
-   --pipeline-model-parallel-size 2
+   --pipeline-model-parallel-size 1
    --context-parallel-size 1
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
-
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
-
-   # --micro-batch-size 1
    --use-dynamic-batch-size
    --max-tokens-per-gpu 9216
 )
@@ -103,7 +101,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dapo
-   --wandb-group qwen3-8B-test-multi-turn
+   --wandb-group slurm-qwen3-8B-code-local
    --wandb-key ${WANDB_KEY}
 )
 
@@ -124,9 +122,9 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   --custom-generate-function-path generate_with_code_execute.generate
-   --custom-rm-path generate_with_code_execute.reward_func
-   --rollout-health-check-timeout 45
+     --custom-generate-function-path generate_with_code_execute.generate
+     --custom-rm-path generate_with_code_execute.reward_func
+     --rollout-health-check-timeout 45
 )
 
 # launch the master node of ray in container
@@ -144,20 +142,26 @@ ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-s
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}:/root/slime\",
+    \"PYTHONPATH\": \"${MEGATRON_REPO_DIR}:${SCRIPT_DIR}:${SLIME_DIR}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"NCCL_NVLS_ENABLE\": \"0\",
+    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
     \"NCCL_SHARP_DISABLE\": \"1\",
-    \"NCCL_DEBUG\": \"INFO\"
+    \"NCCL_DEBUG\": \"WARN\",
+    \"TORCH_COMPILE_DISABLE\": \"1\",
+    \"TORCHDYNAMO_DISABLE\": \"1\"
   }
 }"
 
+TARGET="${MOUNT_DIR}/test/"
+
+echo "Wrting samples to ${TARGET}"
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 8 \
    --colocate \
+   --output_sample_file "${TARGET}" \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \

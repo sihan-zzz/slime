@@ -19,10 +19,11 @@ logger = logging.getLogger(__name__)
 
 # TODO: don't read the whole file into memory.
 def read_file(path):
+    logger.info(f"zzzzlog reading from {path}")
     path, row_slice = _parse_generalized_path(path)
 
     if path.endswith(".jsonl"):
-        df = pd.read_json(path, lines=True, dtype={"label": str})
+        df = pd.read_json(path, lines=True, dtype={"label": float})
     elif path.endswith(".parquet"):
         df = pd.read_parquet(path, dtype_backend="pyarrow")
     else:
@@ -222,5 +223,9 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
             continue
         val = get_partition(data[key])
         rollout_data[key] = val
+    
+    # Handle index_mapping separately as it's a dictionary, not a list
+    if "index_mapping" in data:
+        rollout_data["index_mapping"] = data["index_mapping"]
 
     return rollout_data

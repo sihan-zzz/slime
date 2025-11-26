@@ -238,6 +238,7 @@ def _init_ray_distributed_post(args):
 async def post(url, payload, max_retries=60):
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
+        assert False, "disabled for now"
         try:
             import ray
 

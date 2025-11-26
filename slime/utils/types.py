@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import torch
 
@@ -23,7 +23,7 @@ class Sample:
     weight_versions: list[str] = field(default_factory=list)
     rollout_log_probs: Optional[list[float]] = None  # Log probabilities from rollout engine
     rollout_routed_experts: Optional[list[list[int]]] = None  # Routed experts from rollout engine
-
+    debug_dict: dict = field(default_factory=dict)
     class Status(Enum):
         PENDING = "pending"
         COMPLETED = "completed"

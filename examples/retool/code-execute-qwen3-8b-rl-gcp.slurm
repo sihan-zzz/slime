@@ -1,11 +1,12 @@
 #!/bin/bash
 #
 #SBATCH --job-name=team_mle
-#SBATCH --nodes=1                      # set how many nodes you want
+#SBATCH --exclusive
 #SBATCH --ntasks-per-node=1            # one launcher per node (procid 0..N-1)
 #SBATCH --gpus-per-node=8              # GPUs per node
-#SBATCH --cpus-per-task=16
 #SBATCH --account=cpt
+#SBATCH --cpus-per-task=224
+#SBATCH --mem=3588G
 #SBATCH --exclude=metavmds1-a4-[5,148,156,173,239,47,121,113,214,98]
 #
 # NOTE:
@@ -127,9 +128,10 @@ RUNTIME_ENV_JSON=$(cat <<EOF
   "env_vars": {
     "PYTHONPATH": "${PYTHONPATH_VALUE}",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-    "NCCL_NVLS_ENABLE": "0",
+    "NCCL_NVLS_ENABLE": "${HAS_NVLINK}",
     "NCCL_SHARP_DISABLE": "1",
-    "NCCL_DEBUG": "INFO"
+    "NCCL_DEBUG": "WARN",
+    "TORCH_COMPILE_DISABLE": "1"
   }
 }
 EOF
@@ -166,48 +168,50 @@ fi
 # srun barrier: use srun to synchronize across nodes (each allocation has one SLURM_PROCID task)
 srun --nodes=${SLURM_NNODES} --ntasks=${SLURM_NNODES} --ntasks-per-node=1 --mpi=none true
 
+MOUNT_DIR="/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/slime"
+
 # Only on head node submit the ray job (this mirrors the original script)
 if [ "${SLURM_PROCID}" -eq 0 ]; then
 
   # these arrays are copied/adapted from your original script; change paths as needed
   CKPT_ARGS=(
-     --hf-checkpoint /mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/slime/qwen3_8b
-     --ref-load /mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/slime/qwen3_8b_torch_dist
-     --save /mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/slime/qwen3-8b-rl-multi-turn/
-     --save-interval 20
-     --rotary-base 1000000
+      --hf-checkpoint ${MOUNT_DIR}/qwen3_8b
+      --ref-load ${MOUNT_DIR}/qwen3_8b_torch_dist
+      --save ${MOUNT_DIR}/qwen3-8b-rl-multi-turn/
+      --save-interval 20
+      --rotary-base 1000000
   )
 
   ROLLOUT_ARGS=(
-     --prompt-data /mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/slime/APPS-dataset/APPS-synthetic-train.jsonl
+     --prompt-data ${MOUNT_DIR}/data/APPS-dataset/APPS-synthetic-train.jsonl
      --input-key prompt
      --label-key label
      --apply-chat-template
      --rollout-shuffle
      --reward-key score
-     --num-rollout 3000
+     --num-rollout 500
      --rollout-batch-size 32
      --n-samples-per-prompt 8
      --rollout-max-response-len 8192
      --rollout-temperature 0.8
      --over-sampling-batch-size 48
-     --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.filter_truncated_samples
+     --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
      --global-batch-size 256
      --balance-data
   )
 
   EVAL_ARGS=(
      --eval-interval 20
-     --eval-prompt-data apps  /mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/slime/APPS-dataset/APPS-synthetic-test.jsonl
+     --eval-prompt-data apps  ${MOUNT_DIR}/data/APPS-dataset/APPS-synthetic-test.jsonl
      --n-samples-per-eval-prompt 4
-     --eval-max-response-len 4096
+     --eval-max-response-len 8192
      --eval-top-p 0.7
   )
 
   PERF_ARGS=(
-     --tensor-model-parallel-size 4
+     --tensor-model-parallel-size 8
      --sequence-parallel
-     --pipeline-model-parallel-size 2
+     --pipeline-model-parallel-size 1
      --context-parallel-size 1
      --expert-model-parallel-size 1
      --expert-tensor-parallel-size 1
@@ -240,12 +244,12 @@ if [ "${SLURM_PROCID}" -eq 0 ]; then
   WANDB_ARGS=(
      --use-wandb
      --wandb-project slime-dapo
-     --wandb-group qwen3-8B-test-multi-turn
+     --wandb-group slurm-qwen3-8B-code-${SLURM_JOB_ID}
      --wandb-key ${WANDB_KEY}
   )
 
   SGLANG_ARGS=(
-     --rollout-num-gpus-per-engine 2
+     --rollout-num-gpus-per-engine 1
      --sglang-mem-fraction-static 0.9
   )
 
@@ -263,6 +267,8 @@ if [ "${SLURM_PROCID}" -eq 0 ]; then
      --rollout-health-check-timeout 45
   )
 
+  TARGET="${MOUNT_DIR}/${SLURM_JOB_ID}/"
+  mkdir ${TARGET}
   # submit the same ray job as you had in containerized setup
   echo "Launching training directly on the head node (this will BLOCK the sbatch until finished)"
   echo "Model args: ${MODEL_ARGS[*]}"
@@ -271,6 +277,7 @@ if [ "${SLURM_PROCID}" -eq 0 ]; then
     --actor-num-nodes ${SLURM_NNODES} \
     --actor-num-gpus-per-node ${GPUS_PER_NODE} \
     --colocate \
+    --output_sample_file "${TARGET}" \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \
     "${ROLLOUT_ARGS[@]}" \

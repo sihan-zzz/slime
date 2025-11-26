@@ -1,4 +1,5 @@
 # Adapted from https://github.com/volcengine/verl/blob/cb809d66e46dfd3342d008628891a14a054fa424/recipe/retool/retool.py
+import os
 import re
 from typing import Any, Dict, List, Optional, Union
 import json
@@ -12,7 +13,9 @@ from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
 from slime.utils.misc import print_eval
+import logging
 
+logger: logging.Logger = logging.getLogger(__name__)
 # Import reward models
 try:
     from slime.rollout.rm_hub.math_dapo_utils import last_boxed_only_string, remove_boxed
@@ -145,10 +148,10 @@ def postprocess_predictions(prediction: str) -> tuple[Optional[str], Union[str, 
 def postprocess_responses(resp: str) -> str:
     """Post-process response to ensure tag completeness"""
 
-    # BOB: in qwen3-8b and above, the model generates thinkings and needs to get rid of it
-    marker="</think>"
-    if marker in resp:
-        resp = resp.split(marker)[-1]
+    # # BOB: in qwen3-8b and above, the model generates thinkings and needs to get rid of it
+    # marker="</think>"
+    # if marker in resp:
+    #     resp = resp.split(marker)[-1]
 
     # Handle <tool_call> tags (new format from Jinja2 template)
     if "<tool_call>" in resp:
@@ -241,7 +244,7 @@ async def execute_predictions(prediction: str, max_tools_calls_per_turn = 4) -> 
 
     return next_obs, done
 
-
+import hashlib
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     """Custom generation function supporting tool calls"""
     assert not args.partial_rollout, "Partial rollout is not supported for " "this function at the moment."
@@ -250,22 +253,25 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     print_eval(f"=== New Sample Index {sample.index} ===")
     print_eval("starting generation...")
     prompt = sample.prompt
-
+    uid = hashlib.md5(prompt.encode()).hexdigest()
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     # Set up the initial prompt with system prompt and tools (outside the loop)
     tool_specs = tool_registry.get_tool_specs()
+    # logger.info(f"zzzzlog gen {uid}, {tool_specs=}")
     prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
-
+    # logger.info(f"zzzzlog in customized generate {prompt=}")
     prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
     response = ""
     response_token_ids = []
     loss_masks = []
     tool_call_count = 0  # Track actual tool call rounds
     output = None
-
+    results = {"prompt": prompt, "uid": uid, "index": sample.index}
+    # logger.info(f"zzzzlog in customized generate {TOOL_CONFIGS["max_turns"]}")
     for turn in range(TOOL_CONFIGS["max_turns"]):
+        results[turn] = {"response_so_far": response}
         print_eval(f"=== Turn {turn} ===")
         print_eval(f"response so far: {response}")
 
@@ -300,7 +306,6 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         # Log payload to wandb for debugging
         try:
             import wandb
-            import weave
 
             if wandb.run is not None:
                 # Count available tools (from tool_specs)
@@ -327,24 +332,39 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             sample.status = Sample.Status.ABORTED
             return sample
 
+        is_truncated = output["meta_info"]["finish_reason"]["type"] == "length"
         cur_response = output["text"]
+        results[turn]["cur_response_raw"] = cur_response
+
+        # logger.info(f"zzzzlog gen {uid} {turn=}, before proc, {prompt=}, {response=}, {cur_response=}")
+        # logger.info(f"zzzzlog in customized generate, before postprocess_responses {turn=}, {cur_response=}")
         cur_response = postprocess_responses(cur_response)
+        results[turn]["cur_response_processed"] = cur_response
+        results[turn]["cur_response_processed_string_len"] = len(cur_response)
+        # logger.info(f"zzzzlog gen {uid} {turn=}, after proc, {prompt=}, {response=}, {cur_response=}")
+        # logger.info(f"zzzzlog in customized generate, after postprocess_responses {turn=}, {cur_response=}")
+
         print_eval(f"====== Post-processed cur_response ======: {cur_response}")
 
         # Record current response tokens
         cur_response_token_ids = state.tokenizer(cur_response, add_special_tokens=False)["input_ids"]
+        results[turn]["cur_response_processed_token_len"] = len(cur_response_token_ids)
         response += cur_response
         response_token_ids += cur_response_token_ids
-        loss_masks += [1] * len(cur_response_token_ids)
-
+        loss_masks += [1 if not is_truncated else 0] * len(cur_response_token_ids) # turn off loss on truncated examples
+        results[turn]["finish_reason"] = output["meta_info"]["finish_reason"]["type"]
         # Check length limit
         if output["meta_info"]["finish_reason"]["type"] == "length":
             print_eval("Length limit reached during generation.")
             break
 
         next_obs, done = await execute_predictions(cur_response, max_tools_calls_per_turn=TOOL_CONFIGS["max_tool_calls_per_turn"])
+
+        results[turn]["ob"] = next_obs
+        results[turn]["done"] = done
         print_eval(f"Next observation: {next_obs}")
         print_eval(f"Done: {done}")
+        # logger.info(f"zzzzlog gen {uid} {turn=}, after exec, {cur_response=}, {next_obs=}, {done=}")
         if done:
             break
 
@@ -352,7 +372,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         # was called)
         if "<interpreter>" in next_obs:
             tool_call_count += 1
-
+        results[turn]["tool_call_count"] = tool_call_count
         assert next_obs != "", "Next observation should not be empty."
         obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
         print_eval(f"before obs, response is now: {response}")
@@ -391,6 +411,15 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         case "stop":
             sample.status = Sample.Status.COMPLETED
 
+    sample.debug_dict = results
+    # # only write out completed and truncated samples
+    # rank = int(os.environ.get("RANK", 0))
+    # if args.output_sample_file:
+    #     if output["meta_info"]["finish_reason"]["type"] in ("length", "stop"):
+    #         with open(args.output_sample_file+f"/{rank}.jsonl", "a") as dump_file:
+    #             dump_file.write(
+    #                 json.dumps(results, indent=2) + "\n"
+    #             )
     return sample
 
 
@@ -443,9 +472,25 @@ async def reward_func(args, sample, **kwargs):
 
     # Get ground truth answer - label is a string, not a dict
     ground_truth = sample.label if sample.label is not None else ""
-
     # use \\boxed{...} answer
     result = compute_score(solution_str, ground_truth, strict_box_verify=True)
+    logger.info(f"zzzzlog grading {result=}, on {solution_str[-100:]=} against {ground_truth=}")
 
+    debug_dict = sample.debug_dict
+    if debug_dict is not None:
+        debug_dict["solution_str"] = solution_str
+        debug_dict["ground_truth"] = ground_truth
+        debug_dict["result"] = result
+        debug_dict["group_index"] = sample.group_index
+        debug_dict["label"] = sample.label
+
+
+        rank = int(os.environ.get("RANK", 0))
+        if args.output_sample_file:
+            if sample.status != Sample.Status.ABORTED:
+                with open(args.output_sample_file+f"/{rank}.jsonl", "a") as dump_file:
+                    dump_file.write(
+                        json.dumps(sample.debug_dict, indent=2) + "\n"
+                    )
     # WARNING: needs to check float or dict is the correct format
     return result

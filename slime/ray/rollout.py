@@ -467,6 +467,15 @@ def _log_eval_rollout_data(rollout_id, args, data):
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, samples), f"eval/{key}/")
+        log_dict[f"eval/{key}-acc"] = data[key]["accuracy"]
+        log_dict[f"eval/{key}-precision"] = data[key]["precision"]
+        log_dict[f"eval/{key}-recall"] = data[key]["recall"]
+        log_dict[f"eval/{key}-tnr"] = data[key]["tnr"]
+        log_dict[f"eval/{key}-f1"] = data[key]["f1"]
+        log_dict[f"eval/{key}-average_response_length"] = data[key]["average_response_length"]
+        log_dict[f"eval/{key}-average_tool_call_count"] = data[key]["average_tool_call_count"]
+        log_dict[f"eval/{key}-average_turn_finished"] = data[key]["average_turn_finished"]
+
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
@@ -498,6 +507,11 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     if args.rollout_num_gpus:
         log_dict["perf/tokens_per_gpu_per_sec"] = sum(response_lengths) / rollout_time / args.rollout_num_gpus
     log_dict["perf/longest_sample_tokens_per_sec"] = max(response_lengths) / rollout_time
+    # Add truncated samples ratio metric
+    truncated_samples = [sample for sample in samples if hasattr(sample, 'status') and sample.status == Sample.Status.TRUNCATED]
+    total_samples = len(samples)
+    truncated_ratio = len(truncated_samples) / total_samples if total_samples > 0 else 0.0
+    log_dict["debug/truncated_samples_ratio"] = truncated_ratio
     log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, samples), f"rollout/")
     logger.info(f"perf {rollout_id}: {log_dict}")
     step = compute_rollout_step(args, rollout_id)

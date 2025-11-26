@@ -17,7 +17,6 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_returns,
 )
 from slime.utils.types import RolloutBatch
-
 from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
 
 
@@ -507,7 +506,8 @@ def policy_loss_function(
         loss += 0 * logits.sum()
 
     train_rollout_logprob_abs_diff = None
-    if "rollout_log_probs" in batch:
+    
+    if batch.get("rollout_log_probs"):
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
 

@@ -525,6 +525,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Note that this may allocate the different response of the same prompt into different training steps."
                 ),
             )
+            # parser.add_argument(
+            #     "--exclude-truncated-samples",
+            #     action="store_true",
+            #     default=False,
+            #     help=(
+            #         "Exclude truncated samples from loss computation and weight updates. "
+            #         "When enabled, only non-truncated samples contribute to model training, "
+            #         "which can improve training quality by avoiding gradient updates from incomplete responses."
+            #     ),
+            # )
 
             parser.add_argument(
                 "--use-dynamic-batch-size",
@@ -996,6 +1006,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="torch",
             )
             parser.add_argument("--check-weight-update-equal", action="store_true")
+            parser.add_argument(
+                "--save-eval-debug-rollout-data",
+                type=str,
+                default=None,
+                help=(
+                    "Save the eval rollout data to this path for debugging. "
+                    "The file will be saved to `save_eval_debug_rollout_data.format(eval_dataset_name, rollout_id)`."
+                )
+            )
             return parser
 
         def add_network_arguments(parser):
@@ -1369,6 +1388,7 @@ def slime_validate_args(args):
     if args.dump_details is not None:
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
         args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
+
 
     if args.load_debug_rollout_data is not None:
         logger.info(

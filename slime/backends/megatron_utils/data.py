@@ -285,7 +285,7 @@ def get_data_iterator(
                     partitions[j][k] += start
             micro_batch_indices.extend(partitions)
 
-        assert len(set(sum(micro_batch_indices, []))) == num_local_samples
+        assert len(set(sum(micro_batch_indices, []))) == num_local_samples, f"num_local_sample is of size[{num_local_samples}], micro_batch_indices of [{len(set(sum(micro_batch_indices, [])))}]"
 
         data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices)
 
@@ -311,13 +311,14 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
         response_lengths = rollout_data["response_lengths"]
         loss_masks = rollout_data["loss_masks"]
         total_lengths = rollout_data["total_lengths"]
-
+        
         for key, val in rollout_data.items():
             if key in [
                 "tokens",
                 "loss_masks",
                 "sample_indices",
                 "rollout_routed_experts",
+                "truncated",
             ]:
                 continue
             # Upload per sample mean for each rollout value

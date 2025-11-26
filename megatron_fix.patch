@@ -1,0 +1,122 @@
+diff --git a/megatron/core/jit.py b/megatron/core/jit.py
+index b1aa3e0b6..7db3cf3a2 100644
+--- a/megatron/core/jit.py
++++ b/megatron/core/jit.py
+@@ -11,8 +11,8 @@ try:
+     if is_torch_min_version("2.2.0a0"):
+         jit_fuser = torch.compile
+ except ImportError:
++    pass
++def noop_decorator(func):
++    return func
+ 
+-    def noop_decorator(func):
+-        return func
+-
+-    jit_fuser = noop_decorator
++jit_fuser = noop_decorator
+diff --git a/megatron/core/pipeline_parallel/schedules.py b/megatron/core/pipeline_parallel/schedules.py
+index e83f8d906..3ad0f49f4 100644
+--- a/megatron/core/pipeline_parallel/schedules.py
++++ b/megatron/core/pipeline_parallel/schedules.py
+@@ -2,8 +2,8 @@
+ 
+ import contextlib
+ from functools import partial
+-from typing import Callable, Iterator, List, Optional, Union
+-
++from typing import Callable, Iterator, List, Optional, TextIO, Union
++import os
+ import torch
+ from torch.autograd.variable import Variable
+ 
+@@ -35,6 +35,42 @@ from .combined_1f1b import (
+ 
+ # Types
+ Shape = Union[List[int], torch.Size]
++import logging
++# Configure logging with file and line information
++def get_rank() -> int:
++    """Get current process rank, defaults to 0 if not in distributed setting."""
++    return int(os.environ.get("RANK", 0))
++
++
++class RankFormatter(logging.Formatter):
++    """Custom formatter that includes the trainer rank in log messages."""
++
++    def format(self, record: logging.LogRecord) -> str:
++        # Add rank information to the record
++        record.rank = get_rank()  # pyre-ignore[16]: LogRecord has no attribute rank
++        return super().format(record)
++
++
++# Set up logging with rank information
++rank_formatter: RankFormatter = RankFormatter(
++    fmt="%(asctime)s - [Rank %(rank)d] %(filename)s:%(lineno)d - %(levelname)s - %(message)s",
++    datefmt="%Y-%m-%d %H:%M:%S",
++)
++
++# Configure root logger
++root_logger: logging.Logger = logging.getLogger()
++root_logger.setLevel(logging.INFO)
++
++# Remove existing handlers to avoid duplication
++for handler in root_logger.handlers[:]:
++    root_logger.removeHandler(handler)
++
++# Add console handler with rank formatter
++console_handler: logging.StreamHandler[TextIO] = logging.StreamHandler()
++console_handler.setFormatter(rank_formatter)
++root_logger.addHandler(console_handler)
++
++logger: logging.Logger = logging.getLogger(__name__)
+ 
+ 
+ def get_forward_backward_func():
+@@ -238,6 +274,8 @@ def forward_step_calc_loss(
+                 if not config.calculate_per_token_loss:
+                     # Protect against division by zero when all tokens are masked
+                     #   in a microbatch.
++                    if not torch.is_tensor(num_tokens):
++                        num_tokens = torch.tensor(num_tokens, device=output_tensor.device, dtype=torch.int)
+                     output_tensor /= torch.clamp(num_tokens, min=1)
+                     output_tensor /= num_microbatches
+             else:
+@@ -384,11 +422,15 @@ def forward_step(
+         model.set_is_first_microbatch()
+     if current_microbatch is not None:
+         set_current_microbatch(model, current_microbatch)
+-
++    logger.info(f"zzzzlog for training, {is_first_microbatch=}")
+     unwrap_output_tensor = False
+     if not isinstance(input_tensor, list):
++        if input_tensor is not None:
++            logger.info(f"zzzzlog for training, input_tensor is not list, {input_tensor.shape=}")
+         input_tensor = [input_tensor]
+         unwrap_output_tensor = True
++    else:
++        logger.info(f"zzzzlog for training, input_tensor is list, {input_tensor[0].shape=}")
+ 
+     set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
+     set_input_tensor(input_tensor)
+@@ -404,6 +446,7 @@ def forward_step(
+             output_tensor, loss_func = forward_step_func(
+                 data_iterator, model, checkpoint_activations_microbatch
+             )
++    logger.info(f"zzzzlog after forward {output_tensor.shape}")
+     output_tensor, num_tokens = forward_step_calc_loss(
+         model,
+         output_tensor,
+diff --git a/megatron/training/checkpointing.py b/megatron/training/checkpointing.py
+index 95bd015a9..6484f1bbb 100644
+--- a/megatron/training/checkpointing.py
++++ b/megatron/training/checkpointing.py
+@@ -1097,7 +1097,7 @@ def _load_base_checkpoint(
+ 
+     # Otherwise we are dealing with global checkpoints
+     # If no tracker file, return nothing
+-    if iteration == -1:
++    if not release and iteration == -1:
+         if not rank0:
+             print_rank_0('WARNING: could not find the metadata file {}'.format(tracker_filename))
+             print_rank_0('    will not load any checkpoints and will start from random')

@@ -5,7 +5,10 @@ import io
 import logging
 from argparse import Namespace
 from collections import defaultdict
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, TextIO, Union
+from pathlib import Path
+import torch
+import os
 
 import numpy as np
 import sglang_router
@@ -18,7 +21,6 @@ from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import DynamicFilterOutput
 from slime.utils.async_utils import run
 from slime.utils.data import Dataset
-from slime.utils.eval_config import EvalDatasetConfig
 from slime.utils.http_utils import get, post
 from slime.utils.mask_utils import get_response_lengths
 from slime.utils.misc import SingletonMeta, load_function
@@ -27,8 +29,41 @@ from slime.utils.types import Sample
 from .rm_hub import async_rm, batched_async_rm
 
 __all__ = ["generate_rollout"]
+# Configure logging with file and line information
+def get_rank() -> int:
+    """Get current process rank, defaults to 0 if not in distributed setting."""
+    return int(os.environ.get("RANK", 0))
 
-logger = logging.getLogger(__name__)
+
+class RankFormatter(logging.Formatter):
+    """Custom formatter that includes the trainer rank in log messages."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        # Add rank information to the record
+        record.rank = get_rank()  # pyre-ignore[16]: LogRecord has no attribute rank
+        return super().format(record)
+
+
+# Set up logging with rank information
+rank_formatter: RankFormatter = RankFormatter(
+    fmt="%(asctime)s - [Rank %(rank)d] %(filename)s:%(lineno)d - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+# Configure root logger
+root_logger: logging.Logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Remove existing handlers to avoid duplication
+for handler in root_logger.handlers[:]:
+    root_logger.removeHandler(handler)
+
+# Add console handler with rank formatter
+console_handler: logging.StreamHandler[TextIO] = logging.StreamHandler()
+console_handler.setFormatter(rank_formatter)
+root_logger.addHandler(console_handler)
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 def _load_and_encode_image(path: str) -> str:
@@ -239,6 +274,7 @@ async def generate_and_rm(
         else:
             sample = await generate(args, sample, sampling_params)
 
+    
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
         return sample
@@ -365,17 +401,25 @@ async def generate_rollout_async(
     data = []
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
+
+    logger.info(
+        f"zzzzlog Starting rollout: {args.rollout_batch_size=}, {args.n_samples_per_prompt=}, {(target_data_size * args.n_samples_per_prompt)=}",
+    )
     while len(data) < target_data_size:
+        # logger.info(f"zzzzlog Entering rollout loop with {state.remaining_batch_size=}, {len(data)=}, {target_data_size=}")
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
             state.submit_generate_tasks(samples)
+        # logger.info(f"zzzzlog after refill, {state.remaining_batch_size=}")
 
         # wait for the generation to finish
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            group: list[Sample] = task.result()
 
+        # logger.info(f"zzzzlog after waiting, got {len(done)=}")
+        for i, task in enumerate(done):
+            group: list[Sample] = task.result()
+            # logger.info(f"zzzzlog for task {i}, got {len(group)=}, {len(group[0].tokens)=}, {group[0].response_length=}, {group[0].label=}, {group[0].reward=}")
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
                 logger.info(
@@ -385,11 +429,12 @@ async def generate_rollout_async(
 
             assert len(group) == args.n_samples_per_prompt
             dynamic_filter_output = _call_dynamic_filter(dynamic_filter, args, group)
+            # logger.info(f"zzzzlog for task {i}, after filtering got, {dynamic_filter_output=}")
             if not dynamic_filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
                 state.remaining_batch_size -= 1
                 continue
-
+            # logger.info(f"zzzzlog for task {i}, trying to add a group of {len(group)=} response to {len(data)}")
             # add the samples to the data
             # NOTE: here we have not stored all the unused samples back to the data buffer.
             if len(data) < target_data_size:
@@ -399,9 +444,9 @@ async def generate_rollout_async(
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(
-        f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {sample.label}, reward: {sample.reward}",
+        f"Finished rollout. Sample: {[str(sample.prompt) + sample.response]}, label: {sample.label}, reward: {sample.reward}",
     )
-    logger.info(f"zzzzlog after rollout {len(data)}, {len(data[0])}")
+    logger.info(f"zzzzlog after rollout getting {len(data)} batches, each batch of {len(data[0])} responses")
 
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)
@@ -449,120 +494,68 @@ EVAL_PROMPT_DATASET = {}
 async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict[str, list[Any]]], list[list[Sample]]]:
     assert not args.group_rm, "Group RM is not supported for eval rollout"
     results = {}
-    for dataset_cfg in getattr(args, "eval_datasets", []) or []:
-        results.update(await eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
+    for i in range(0, len(args.eval_prompt_data), 2):
+        name, path = args.eval_prompt_data[i : i + 2]
+        results.update(await eval_rollout_single_dataset(args, rollout_id, name, path))
     return RolloutFnEvalOutput(data=results), []
 
 
 async def eval_rollout_single_dataset(
-    args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig
+    args: Namespace, rollout_id: int, name: str, path: str
 ) -> dict[str, dict[str, list[Any]]]:
     """An example to implement the eval_rollout function for an rule based rm rollout generation.
 
     Args:
         args: the whole args
         rollout_id: int, the id of the rollout, used for deterministic data generation
-        dataset_cfg: configuration of the dataset
+        name: str, the name of the dataset
+        path: str, the path of the dataset
     """
     assert not args.group_rm, "Group RM is not supported for eval rollout"
 
     global EVAL_PROMPT_DATASET
 
-    name = dataset_cfg.name
-    path = dataset_cfg.path
-
-    def _resolve_dataset_setting(dataset_value, eval_value, rollout_value):
-        if dataset_value is not None:
-            return dataset_value
-        if eval_value is not None:
-            return eval_value
-        return rollout_value
-
-    prompt_key = _resolve_dataset_setting(
-        dataset_cfg.prompt_key,
-        args.eval_input_key,
-        args.input_key,
-    )
-    label_key = _resolve_dataset_setting(
-        dataset_cfg.label_key,
-        args.eval_label_key,
-        args.label_key,
-    )
-    tool_key = _resolve_dataset_setting(
-        dataset_cfg.tool_key,
-        args.eval_tool_key,
-        args.tool_key,
-    )
-    metadata_key = dataset_cfg.metadata_key or getattr(args, "metadata_key", "metadata")
-
-    cache_key = dataset_cfg.cache_key + (args.hf_checkpoint, args.apply_chat_template)
-    if cache_key not in EVAL_PROMPT_DATASET:
+    if name not in EVAL_PROMPT_DATASET:
         tokenizer = AutoTokenizer.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
-        EVAL_PROMPT_DATASET[cache_key] = Dataset(
+        EVAL_PROMPT_DATASET[name] = Dataset(
             path,
             tokenizer=tokenizer,
             max_length=args.rollout_max_prompt_len,
-            prompt_key=prompt_key,
-            label_key=label_key,
+            prompt_key=args.input_key if args.eval_input_key is None else args.eval_input_key,
+            label_key=args.label_key if args.eval_label_key is None else args.eval_label_key,
             multimodal_keys=args.multimodal_keys,
-            metadata_key=metadata_key,
-            tool_key=tool_key,
+            metadata_key=args.metadata_key,
+            tool_key=args.tool_key if args.eval_tool_key is None else args.eval_tool_key,
             apply_chat_template=args.apply_chat_template,
             apply_chat_template_kwargs=args.apply_chat_template_kwargs,
         )
-    dataset = EVAL_PROMPT_DATASET[cache_key]
+    dataset = EVAL_PROMPT_DATASET[name]
 
-    base_sampling_params = dict(
-        temperature=_resolve_dataset_setting(dataset_cfg.temperature, args.eval_temperature, args.rollout_temperature),
-        top_p=_resolve_dataset_setting(
-            dataset_cfg.top_p,
-            args.eval_top_p,
-            args.rollout_top_p,
+    sampling_params = dict(
+        temperature=args.rollout_temperature if args.eval_temperature is None else args.eval_temperature,
+        top_p=args.rollout_top_p if args.eval_top_p is None else args.eval_top_p,
+        top_k=args.rollout_top_k if args.eval_top_k is None else args.eval_top_k,
+        max_new_tokens=(
+            args.rollout_max_response_len if args.eval_max_response_len is None else args.eval_max_response_len
         ),
-        top_k=_resolve_dataset_setting(
-            dataset_cfg.top_k,
-            args.eval_top_k,
-            args.rollout_top_k,
-        ),
-        max_new_tokens=_resolve_dataset_setting(
-            dataset_cfg.max_response_len,
-            args.eval_max_response_len,
-            args.rollout_max_response_len,
-        ),
-        stop=dataset_cfg.stop if dataset_cfg.stop is not None else args.rollout_stop,
-        stop_token_ids=(
-            dataset_cfg.stop_token_ids if dataset_cfg.stop_token_ids is not None else args.rollout_stop_token_ids
-        ),
+        stop=args.rollout_stop,
+        stop_token_ids=args.rollout_stop_token_ids,
         skip_special_tokens=args.rollout_skip_special_tokens,
         no_stop_trim=True,
         spaces_between_special_tokens=False,
-    )
-
-    min_new_tokens = dataset_cfg.min_new_tokens
-    if min_new_tokens is None:
-        min_new_tokens = getattr(args, "eval_min_new_tokens", None)
-    if min_new_tokens is not None:
-        base_sampling_params["min_new_tokens"] = min_new_tokens
-
-    n_samples_per_prompt = (
-        dataset_cfg.n_samples_per_eval_prompt
-        if dataset_cfg.n_samples_per_eval_prompt is not None
-        else args.n_samples_per_eval_prompt
     )
 
     tasks = []
     # do multiple samples for eval prompts
     sample_index = 0
     for i, prompt_sample in enumerate(dataset.samples):
-        for j in range(n_samples_per_prompt):
+        for j in range(args.n_samples_per_eval_prompt):
             # use the same prompt for multiple samples
             sample = copy.deepcopy(prompt_sample)
             sample.index = sample_index
             sample_index += 1
-            sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
-            sampling_params = base_sampling_params
             if getattr(args, "sglang_enable_deterministic_inference", False):
-                sampling_params = base_sampling_params.copy()
+                sampling_params = sampling_params.copy()
                 sampling_params["sampling_seed"] = args.rollout_seed + j
             tasks.append(
                 generate_and_rm(
@@ -595,16 +588,79 @@ async def eval_rollout_single_dataset(
     data.sort(key=lambda sample: sample.index)
 
     reward_key = args.eval_reward_key or args.reward_key
+
+    # _save_debug_rollout_data(args, data, rollout_id)
+
+    # TODO (Bob): needs to add a utility function or organize this function better. only temp for now
+    tp = sum(
+        1
+        for sample in data
+        if "pred" in sample.reward and "gt" in sample.reward
+        and sample.reward["pred"] == 1 and sample.reward["gt"] == 1 and not sample.status == Sample.Status.TRUNCATED
+    )
+    tn = sum(
+        1
+        for sample in data
+        if "pred" in sample.reward and "gt" in sample.reward
+        and sample.reward["pred"] == 0 and sample.reward["gt"] == 0 and not sample.status == Sample.Status.TRUNCATED
+    )
+    fp = sum(
+        1
+        for sample in data
+        if "pred" in sample.reward and "gt" in sample.reward
+        and sample.reward["pred"] == 1 and sample.reward["gt"] == 0 and not sample.status == Sample.Status.TRUNCATED
+    )
+    fn = sum(
+        1
+        for sample in data
+        if "pred" in sample.reward and "gt" in sample.reward
+        and sample.reward["pred"] == 0 and sample.reward["gt"] == 1 and not sample.status == Sample.Status.TRUNCATED
+    )
+
+    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    tnr = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    num_none = sum(1 for sample in data if sample.reward["pred"] is None)
+    average_response_length = sum(sample.response_length for sample in data if not sample.status == Sample.Status.TRUNCATED) / len(data)
+    average_tool_call_count = sum(sample.tool_call_count for sample in data if not sample.status == Sample.Status.TRUNCATED) / len(data)
+    average_turn_finished = sum(sample.turn_finished for sample in data if not sample.status == Sample.Status.TRUNCATED) / len(data)
     return {
         name: {
             "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
+            "accuracy": accuracy,
+            "recall": recall,
+            "precision": precision,
+            "tnr": tnr,
+            "f1": f1,
+            "ratio_none": num_none / len(data),
+            "average_response_length": average_response_length,
+            "average_tool_call_count": average_tool_call_count,
+            "average_turn_finished": average_turn_finished,
         }
     }
 
+# def _save_debug_rollout_data(args, data, rollout_id):
+#         # TODO to be refactored (originally Buffer._set_data)
+#         if (path_template := args.save_eval_debug_rollout_data) is not None:
+#             path = Path(path_template.format(rollout_id=rollout_id))
+#             print(f"Save eval debug rollout data to {path}")
+#             path.parent.mkdir(parents=True, exist_ok=True)
+#             torch.save(
+#                 dict(
+#                     rollout_id=rollout_id,
+#                     samples=[sample.to_dict() for sample in data],
+#                 ),
+#                 path,
+#             )
+
+
 
 # TODO remove this temp function
+# BOB: this is the rollout function as default
 def generate_rollout(
     args: Namespace, rollout_id: int, data_buffer: Any, evaluation: bool = False
 ) -> Union[RolloutFnTrainOutput, RolloutFnEvalOutput]:
