@@ -7,7 +7,7 @@
 #SBATCH --account=cpt
 #SBATCH --cpus-per-task=224
 #SBATCH --mem=3588G
-#SBATCH --exclude=metavmds1-a4-[5,148,156,173,239,47,121,113,214,98]
+#SBATCH --exclude=metavmds1-a4-[0]
 #
 # NOTE:
 # - Adjust nodes/gpus/cpus/time/partition to your GCP/Slurm cluster.
@@ -20,17 +20,23 @@ set -ex
 
 # --- user tweakables ---
 GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-8}}  # fallback if your cluster exposes env var differently
+export GPUS_PER_NODE
+export TRAIN_NODES=${TRAIN_NODES:-2}
+export ROLLOUT_NODES=$(($SLURM_NNODES - TRAIN_NODES))
+echo "Training using ${TRAIN_NODES} nodes, rollout using ${ROLLOUT_NODES} nodes."
 PYTHON=python
 WORKSPACE_DIR="/home/sihanzeng_meta_com/uv"
 
 export LOG_DIR=${WORKSPACE_DIR}/logs
-export UNIQUE_JOB_NAME=${SLURM_JOB_NAME}_${SLURM_JOB_ID}
+export UNIQUE_JOB_NAME=${SLURM_JOB_ID}_${SLURM_JOB_NAME}
 export LOG_PREFIX=${LOG_DIR}/${UNIQUE_JOB_NAME}
 echo "Creating log directory at $LOG_PREFIX"
 mkdir -p "$LOG_PREFIX"
 exec > "$LOG_PREFIX/sbatch.out" 2>&1
+
+export RAY_NODE_LOG_BASE="${LOG_PREFIX}/ray_node"
 export RAY_NODE_LOG="${LOG_PREFIX}/ray_node_${SLURM_PROCID:-0}.out"
-export RAY_TEMP_DIR="${LOG_PREFIX}/ray_temp_${SLURM_PROCID:-0}"
+export RAY_TEMP_DIR="/tmp/ray_${SLURM_JOB_ID}_${SLURM_PROCID:-0}"
 export MAIN_NODE_LOG="${LOG_PREFIX}/main_${SLURM_PROCID:-0}.out"
 
 # Ensure we always tear down Ray on exit.
@@ -63,7 +69,7 @@ export CPLUS_INCLUDE_PATH="$CUDA_HOME/include:${CPLUS_INCLUDE_PATH:-}"
 # TorchMemorySaver used by sglang currently errors when expandable_segments is on.
 # Leave unset to keep the default allocator unless you know you are not using TorchMemorySaver.
 # export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export TRITON_CACHE_DIR="${HOME}/local/tmp/${SLURM_JOB_ID}/${SLURM_PROCID:-0}"
+export TRITON_CACHE_DIR="/tmp/${SLURM_JOB_ID}/${SLURM_PROCID:-0}"
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export NCCL_IB_DISABLE=0
 export NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-3}
@@ -90,9 +96,13 @@ export TORCHDYNAMO_DISABLE
 # module load cuda/12.1
 # source /path/to/venv/bin/activate
 
-# helper: head hostname
-MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
-MASTER_PORT=${MASTER_PORT:-$((10000 + SLURM_JOB_ID % 20000))}   # stable-ish per-job port
+MASTER_HOSTNAME=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+# Prefer the same interface used in other jobs on this cluster.
+MASTER_ADDR=$(srun --nodes=1 --ntasks=1 -w "$MASTER_HOSTNAME" ip addr show enp192s20 | grep -Po 'inet \K[\d.]+' | head -n1)
+: "${MASTER_ADDR:=${MASTER_HOSTNAME}}"
+MASTER_PORT=${MASTER_PORT:-$((20000 + SLURM_JOB_ID % 20000))}
+# MASTER_PORT=6379
+export MASTER_ADDR MASTER_PORT
 
 echo "SLURM_JOBID: $SLURM_JOB_ID"
 echo "NODES: $SLURM_JOB_NODELIST"
@@ -101,10 +111,60 @@ echo "MASTER_PORT: $MASTER_PORT"
 echo "SLURM_PROCID: $SLURM_PROCID"
 echo "GPUS_PER_NODE: $GPUS_PER_NODE"
 
+echo "=== HEALTH CHECK (silent unless errors) ==="
+
+BAD_NODES=$(srun \
+  --nodes=$SLURM_JOB_NUM_NODES \
+  --ntasks-per-node=1 \
+  --cpus-per-task=1 \
+  --mpi=none \
+  --kill-on-bad-exit=0 \
+  bash -lc '
+    H=$(hostname)
+
+    # Try checks; if any fails, print hostname but DO NOT exit non-zero.
+    failed=0
+
+    nvidia-smi -L >/dev/null 2>&1 || failed=1
+    ls /tmp >/dev/null 2>&1 || failed=1
+
+    python3 - <<EOF >/dev/null 2>&1 || failed=1
+import torch
+import os
+assert torch.cuda.is_available()
+torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+EOF
+
+    # If any check failed → print hostname
+    if [[ $failed -ne 0 ]]; then
+      echo "$H"
+    fi
+
+    exit 0   # <- IMPORTANT: always exit with 0 so srun never hangs
+  ' | tr -d '[:space:]')
+
+if [[ -n "$BAD_NODES" ]]; then
+  echo "❌ BAD NODES DETECTED:"
+  printf "%s\n" "$BAD_NODES"
+  echo "Aborting before torchrun rendezvous."
+  exit 1
+fi
+
+echo "=== HEALTH CHECK PASSED ==="
+
 # clean up any stale processes (only on nodes in this allocation)
-pkill -9 sglang || true
-pkill -9 ray || true
-pkill -9 python || true
+srun --nodes=$SLURM_NNODES \
+     --ntasks-per-node=1 \
+     --cpus-per-task=1 \
+     --mpi=none \
+     bash -lc '
+       echo "=== $(hostname): cleaning processes ==="
+       pkill -9 sglang 2>/dev/null || true
+       pkill -9 ray 2>/dev/null || true
+       pkill -9 python 2>/dev/null || true
+       ray stop --force 2>/dev/null || true
+       echo "=== $(hostname): done ==="
+     '
 sleep 2
 
 # detect NVLink if you need to set NCCL flags
@@ -137,189 +197,178 @@ RUNTIME_ENV_JSON=$(cat <<EOF
 EOF
 )
 
-#
-# Start Ray cluster inside the Slurm allocation
-# We start one ray head on SLURM_PROCID==0 and join from others.
-#
-if [ "${SLURM_PROCID}" -eq 0 ]; then
-  echo "Starting ray head on ${MASTER_ADDR}"
-  ray stop --force || true
-  # start head (dashboard on 8265 so we can submit the job)
-  ray start --head \
-    --node-ip-address "${MASTER_ADDR}" \
-    --num-gpus ${GPUS_PER_NODE} \
-    --disable-usage-stats \
-    --dashboard-host=0.0.0.0 \
-    --dashboard-port=8265 \
-    --temp-dir ${RAY_TEMP_DIR} | tee -a "${RAY_NODE_LOG}"
-  # small wait for the head to be ready
-  sleep 5
-else
-  # other nodes join the head
-  echo "Joining ray head at ${MASTER_ADDR}"
-  ray stop --force || true
-  ray start --address="${MASTER_ADDR}:6379" \
-    --num-gpus ${GPUS_PER_NODE} \
-    --disable-usage-stats \
-    --temp-dir ${RAY_TEMP_DIR} | tee -a "${RAY_NODE_LOG}"
-fi
-
-# wait for all ray nodes to be ready
-# srun barrier: use srun to synchronize across nodes (each allocation has one SLURM_PROCID task)
-srun --nodes=${SLURM_NNODES} --ntasks=${SLURM_NNODES} --ntasks-per-node=1 --mpi=none true
-
 MOUNT_DIR="/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/slime"
 
-# Only on head node submit the ray job (this mirrors the original script)
-if [ "${SLURM_PROCID}" -eq 0 ]; then
+CKPT_ARGS=(
+   --hf-checkpoint ${MOUNT_DIR}/qwen3_8b
+   --ref-load ${MOUNT_DIR}/qwen3_8b_torch_dist
+   --save ${MOUNT_DIR}/qwen3-8b-rl-multi-turn/
+   --save-interval 20
+   --rotary-base 1000000
+)
 
-  # these arrays are copied/adapted from your original script; change paths as needed
-  CKPT_ARGS=(
-      --hf-checkpoint ${MOUNT_DIR}/qwen3_8b
-      --ref-load ${MOUNT_DIR}/qwen3_8b_torch_dist
-      --save ${MOUNT_DIR}/qwen3-8b-rl-multi-turn/
-      --save-interval 20
-      --rotary-base 1000000
-  )
+export NUM_ROLLOUT=${NUM_ROLLOUT:-500}
 
-  ROLLOUT_ARGS=(
-     --prompt-data ${MOUNT_DIR}/data/APPS-dataset/APPS-synthetic-train.jsonl
-     --input-key prompt
-     --label-key label
-     --apply-chat-template
-     --rollout-shuffle
-     --reward-key score
-     --num-rollout 500
-     --rollout-batch-size 32
-     --n-samples-per-prompt 8
-     --rollout-max-response-len 8192
-     --rollout-temperature 0.8
-     --over-sampling-batch-size 48
-     --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
-     --global-batch-size 256
-     --balance-data
-  )
+export TRAIN_DATA=${TRAIN_DATA:-${MOUNT_DIR}/data/APPS-dataset/APPS-synthetic-train.jsonl}
+export EVAL_DATA=${EVAL_DATA:-${MOUNT_DIR}/data/APPS-dataset/APPS-synthetic-test.jsonl}
+ROLLOUT_ARGS=(
+   --prompt-data $TRAIN_DATA
+   --input-key prompt
+   --label-key label
+   --apply-chat-template
+   --rollout-shuffle
+   --reward-key score
+   --num-rollout ${NUM_ROLLOUT}
+   --rollout-batch-size 32
+   --n-samples-per-prompt 8
+   --rollout-max-response-len 4096
+   --rollout-temperature 0.8
+   --over-sampling-batch-size 64
+   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+   --global-batch-size 256
+   --balance-data
+   --rollout-num-gpus $((8 * $ROLLOUT_NODES))
+)
 
-  EVAL_ARGS=(
-     --eval-interval 20
-     --eval-prompt-data apps  ${MOUNT_DIR}/data/APPS-dataset/APPS-synthetic-test.jsonl
-     --n-samples-per-eval-prompt 4
-     --eval-max-response-len 8192
-     --eval-top-p 0.7
-  )
+EVAL_ARGS=(
+   --eval-interval 20
+   --eval-prompt-data ${EVAL_DATA}
+   --n-samples-per-eval-prompt 1
+   --eval-max-response-len 4096
+   --eval-top-p 0.7
+)
 
-  PERF_ARGS=(
-     --tensor-model-parallel-size 8
-     --sequence-parallel
-     --pipeline-model-parallel-size 1
-     --context-parallel-size 1
-     --expert-model-parallel-size 1
-     --expert-tensor-parallel-size 1
-     --recompute-granularity full
-     --recompute-method uniform
-     --recompute-num-layers 1
-     --use-dynamic-batch-size
-     --max-tokens-per-gpu 9216
-  )
+PERF_ARGS=(
+   --tensor-model-parallel-size 4
+   --sequence-parallel
+   --pipeline-model-parallel-size 1
+   --context-parallel-size 1
+   --expert-model-parallel-size 1
+   --expert-tensor-parallel-size 1
+   # --recompute-granularity full
+   # --recompute-method uniform
+   # --recompute-num-layers 1
+   --use-dynamic-batch-size
+   --max-tokens-per-gpu 65536
+)
 
-  GRPO_ARGS=(
-     --advantage-estimator grpo
-     --use-kl-loss
-     --kl-loss-coef 0.00
-     --kl-loss-type low_var_kl
-     --entropy-coef 0.00
-     --eps-clip 0.2
-     --eps-clip-high 0.28
-  )
+GRPO_ARGS=(
+   --advantage-estimator grpo
+   --use-kl-loss
+   --kl-loss-coef 0.00
+   --kl-loss-type low_var_kl
+   --entropy-coef 0.00
+   --eps-clip 0.2
+   --eps-clip-high 0.28
+)
 
-  OPTIMIZER_ARGS=(
-     --optimizer adam
-     --lr 1e-6
-     --lr-decay-style constant
-     --weight-decay 0.1
-     --adam-beta1 0.9
-     --adam-beta2 0.98
-  )
+OPTIMIZER_ARGS=(
+   --optimizer adam
+   --lr 1e-6
+   --lr-decay-style constant
+   --weight-decay 0.1
+   --adam-beta1 0.9
+   --adam-beta2 0.98
+)
 
-  WANDB_ARGS=(
-     --use-wandb
-     --wandb-project slime-dapo
-     --wandb-group slurm-qwen3-8B-code-${SLURM_JOB_ID}
-     --wandb-key ${WANDB_KEY}
-  )
+WANDB_ARGS=(
+   --use-wandb
+   --wandb-project slime-dapo
+   --wandb-group ${SLURM_JOB_ID}-${SLURM_JOB_NAME}
+   --wandb-key ${WANDB_KEY}
+)
 
-  SGLANG_ARGS=(
-     --rollout-num-gpus-per-engine 1
-     --sglang-mem-fraction-static 0.9
-  )
+SGLANG_ARGS=(
+   --rollout-num-gpus-per-engine 1
+   --sglang-mem-fraction-static 0.9
+)
 
-  MISC_ARGS=(
-     --attention-dropout 0.0
-     --hidden-dropout 0.0
-     --accumulate-allreduce-grads-in-fp32
-     --attention-softmax-in-fp32
-     --attention-backend flash
-  )
+MISC_ARGS=(
+   --attention-dropout 0.0
+   --hidden-dropout 0.0
+   --accumulate-allreduce-grads-in-fp32
+   --attention-softmax-in-fp32
+   --no-fp8-wgrad
+   --attention-backend flash
 
-  CUSTOM_ARGS=(
-     --custom-generate-function-path generate_with_code_execute.generate
-     --custom-rm-path generate_with_code_execute.reward_func
-     --rollout-health-check-timeout 45
-  )
+   # # for debug
+   # --no-gradient-accumulation-fusion
+   # --no-gradient-reduce-div-fusion
+   # --disable-tp-comm-bulk-wgrad
+)
 
-  TARGET="${MOUNT_DIR}/${SLURM_JOB_ID}/"
-  mkdir ${TARGET}
-  # submit the same ray job as you had in containerized setup
-  echo "Launching training directly on the head node (this will BLOCK the sbatch until finished)"
-  echo "Model args: ${MODEL_ARGS[*]}"
-  export PYTHONPATH="${PYTHONPATH_VALUE}"
-  ${PYTHON} train.py \
-    --actor-num-nodes ${SLURM_NNODES} \
-    --actor-num-gpus-per-node ${GPUS_PER_NODE} \
-    --colocate \
-    --output_sample_file "${TARGET}" \
-    "${MODEL_ARGS[@]}" \
-    "${CKPT_ARGS[@]}" \
-    "${ROLLOUT_ARGS[@]}" \
-    "${OPTIMIZER_ARGS[@]}" \
-    "${GRPO_ARGS[@]}" \
-    "${WANDB_ARGS[@]}" \
-    "${PERF_ARGS[@]}" \
-    "${EVAL_ARGS[@]}" \
-    "${SGLANG_ARGS[@]}" \
-    "${MISC_ARGS[@]}" \
-    "${CUSTOM_ARGS[@]}" \
-  2>&1 | tee ${MAIN_NODE_LOG}
+CUSTOM_ARGS=(
+   --custom-generate-function-path generate_with_code_execute.generate
+   --custom-rm-path generate_with_code_execute.reward_func
+   --rollout-health-check-timeout 45
+)
 
-  TRAIN_EXIT_CODE=${PIPESTATUS[0]:-0}
-  echo "train.py exited with code ${TRAIN_EXIT_CODE}"
-  # ray stop only after training completes
-  ray stop --force || true
-  exit ${TRAIN_EXIT_CODE}
+TARGET="${MOUNT_DIR}/${SLURM_JOB_ID}/"
+mkdir ${TARGET}
+TRAIN_CMD=(
+   ${PYTHON}
+   train.py
+   --actor-num-nodes ${TRAIN_NODES}
+   --actor-num-gpus-per-node ${GPUS_PER_NODE}
+   --output_sample_file "${TARGET}"
+)
+TRAIN_CMD+=("${MODEL_ARGS[@]}")
+TRAIN_CMD+=("${CKPT_ARGS[@]}")
+TRAIN_CMD+=("${ROLLOUT_ARGS[@]}")
+TRAIN_CMD+=("${OPTIMIZER_ARGS[@]}")
+TRAIN_CMD+=("${GRPO_ARGS[@]}")
+TRAIN_CMD+=("${WANDB_ARGS[@]}")
+TRAIN_CMD+=("${PERF_ARGS[@]}")
+TRAIN_CMD+=("${EVAL_ARGS[@]}")
+TRAIN_CMD+=("${SGLANG_ARGS[@]}")
+TRAIN_CMD+=("${MISC_ARGS[@]}")
+TRAIN_CMD+=("${CUSTOM_ARGS[@]}")
+TRAIN_CMD_STR=$(printf '%q ' "${TRAIN_CMD[@]}")
+TRAIN_CMD_STR=${TRAIN_CMD_STR% }
+
+echo "Launching training directly on the head node (this will BLOCK the sbatch until finished)"
+echo "Model args: ${MODEL_ARGS[*]}"
+export PYTHONPATH="${PYTHONPATH_VALUE}"
+
+srun --nodes=${SLURM_NNODES} \
+     --ntasks=${SLURM_NNODES} \
+     --ntasks-per-node=1 \
+     --kill-on-bad-exit=1 \
+     --mpi=none \
+     bash -lc "
+set -euox pipefail
+
+LOGFILE=\"${RAY_NODE_LOG_BASE}_\${SLURM_PROCID}.out\"
+
+if [[ \$SLURM_PROCID -eq 0 ]]; then
+   echo \"[HEAD] Starting Ray head on ${MASTER_ADDR}:${MASTER_PORT}\"
+   ray start --head \
+      --node-ip-address=${MASTER_ADDR} \
+      --port=${MASTER_PORT} \
+      --dashboard-host=0.0.0.0 \
+      --dashboard-port=8265 \
+      --disable-usage-stats \
+      > \$LOGFILE 2>&1 &
+
+   sleep 5
+
+   echo \"[HEAD] Running Python connectivity test\"
+   export RAY_ADDRESS=${MASTER_ADDR}:${MASTER_PORT}
+   # python examples/retool/ray_connectivity.py 2>&1 | tee ${RAY_NODE_LOG_BASE}_ray_connect.out
+   ${TRAIN_CMD_STR} \
+   2>&1 | tee ${MAIN_NODE_LOG}
+
+   TRAIN_EXIT_CODE=\${PIPESTATUS[0]:-0}
+   echo \"python exited with code \${TRAIN_EXIT_CODE}, stopping ray across board.\"
+   ray stop --force || true
+   exit 1 
+else
+   echo \"[WORKER \$SLURM_PROCID] Starting worker and holding step open\"
+   sleep 5
+   nohup ray start --address=${MASTER_ADDR}:${MASTER_PORT} \
+      --disable-usage-stats \
+      --num-gpus ${GPUS_PER_NODE} \
+      > \$LOGFILE 2>&1 &
+   sleep infinity
 fi
-
-# ---------------------------
-# Alternative: Slurm-native rendezvous (torchrun)
-# ---------------------------
-# If you prefer to bypass Ray and run PyTorch's distributed backend directly using Slurm's rendezvous:
-# - Use --ntasks-per-node=$GPUS_PER_NODE and launch one launcher per GPU OR
-# - Use torchrun with --nproc_per_node=${GPUS_PER_NODE} and srun to allocate nodes.
-# Example (uncomment & adapt if you want):
-#
-# if you want to use torch.distributed rendezvous:
-#   export NCCL_DEBUG=INFO
-#   export PYTHONPATH="${PYTHONPATH_VALUE}"
-#   # Run torchrun with c10d rendezvous on MASTER_ADDR:MASTER_PORT
-#   srun --nodes=${SLURM_NNODES} --ntasks=${SLURM_NNODES} --ntasks-per-node=1 --mpi=none \
-#     ${PYTHON} -m torch.distributed.run \
-#       --nnodes=${SLURM_NNODES} \
-#       --nproc_per_node=${GPUS_PER_NODE} \
-#       --rdzv_backend=c10d \
-#       --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
-#       --rdzv_id=${SLURM_JOB_ID} \
-#       train.py \
-#       --actor-num-nodes ${SLURM_NNODES} \
-#       --actor-num-gpus-per-node ${GPUS_PER_NODE} \
-#       ...
-#
-# Adjust train.py flags so that it uses torch.distributed (no ray).
+"

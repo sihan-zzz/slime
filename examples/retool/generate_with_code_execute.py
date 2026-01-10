@@ -77,10 +77,10 @@ def format_conversation_with_tools(
         system_content = system_prompt
     else:
         system_content = (
-        "You are a program solution verifier that can use Python "
-        "tools to verify whether a program is a correct solution to a coding problem. "
-        "Use the code_interpreter tool when necessary to run any code needed for verification."
-    )
+            "You are a program solution verifier that can use Python "
+            "tools to verify whether a program is a correct solution to a coding problem. "
+            "Use the code_interpreter tool when necessary to run any code needed for verification."
+        )
 
     messages_to_render.append({"role": "system", "content": system_content})
 
@@ -98,7 +98,9 @@ def format_conversation_with_tools(
     return formatted_text
 
 
-def postprocess_predictions(prediction: str) -> tuple[Optional[str], Union[str, Dict[str, Any], List[tuple[str, Dict[str, Any]]]]]:
+def postprocess_predictions(
+    prediction: str,
+) -> tuple[Optional[str], Union[str, Dict[str, Any], List[tuple[str, Dict[str, Any]]]]]:
     """Extract actions and content (supports multiple <tool_call> blocks)"""
     # 1. Check for Answer:\boxed{...}
     answer_pattern = r"Answer:\s*\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
@@ -187,7 +189,7 @@ def postprocess_responses(resp: str) -> str:
     return resp
 
 
-async def execute_predictions(prediction: str, max_tools_calls_per_turn = 4) -> str:
+async def execute_predictions(prediction: str, max_tools_calls_per_turn=4) -> str:
     """Execute predictions and return results"""
     action, content = postprocess_predictions(prediction)
 
@@ -244,11 +246,16 @@ async def execute_predictions(prediction: str, max_tools_calls_per_turn = 4) -> 
 
     return next_obs, done
 
+
 import hashlib
+
+
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     """Custom generation function supporting tool calls"""
     assert not args.partial_rollout, "Partial rollout is not supported for " "this function at the moment."
-    assert sample is not None and isinstance(sample, Sample), "Sample must be provided and be an instance of Sample class."
+    assert sample is not None and isinstance(
+        sample, Sample
+    ), "Sample must be provided and be an instance of Sample class."
 
     print_eval(f"=== New Sample Index {sample.index} ===")
     print_eval("starting generation...")
@@ -295,7 +302,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             sample.status = Sample.Status.TRUNCATED
             print_eval("Context length limit reached, stopping generation.")
             break
-            
+
         # Simple: just send prompt + response
         payload = {
             "text": prompt + response,
@@ -314,7 +321,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 tools_used = response.count("<interpreter>")
 
                 wandb.log(
-                    {   
+                    {
                         "debug/payload_length": len(prompt + response),
                         "debug/num_token": len(state.tokenizer(prompt + response)["input_ids"]),
                         "debug/available_tools": available_tools,
@@ -351,15 +358,21 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         results[turn]["cur_response_processed_token_len"] = len(cur_response_token_ids)
         response += cur_response
         response_token_ids += cur_response_token_ids
-        loss_masks += [1 if not is_truncated else 0] * len(cur_response_token_ids) # turn off loss on truncated examples
+        loss_masks += [1 if not is_truncated else 0] * len(
+            cur_response_token_ids
+        )  # turn off loss on truncated examples
         results[turn]["finish_reason"] = output["meta_info"]["finish_reason"]["type"]
         # Check length limit
         if output["meta_info"]["finish_reason"]["type"] == "length":
             print_eval("Length limit reached during generation.")
             break
 
-        next_obs, done = await execute_predictions(cur_response, max_tools_calls_per_turn=TOOL_CONFIGS["max_tool_calls_per_turn"])
+        next_obs, done = await execute_predictions(
+            cur_response, max_tools_calls_per_turn=TOOL_CONFIGS["max_tool_calls_per_turn"]
+        )
 
+        if len(next_obs) > 5000:
+            next_obs = next_obs[:5000] + "[Truncated]"
         results[turn]["ob"] = next_obs
         results[turn]["done"] = done
         print_eval(f"Next observation: {next_obs}")
@@ -455,12 +468,13 @@ def compute_score(
     reward = 1.0 if correct else -1.0
     # acc = correct
     result = {
-        "score": reward, # int
-        "pred": pred, # int
-        "gt": ground_truth, # int
+        "score": reward,  # int
+        "pred": pred,  # int
+        "gt": ground_truth,  # int
     }
 
     return result
+
 
 async def reward_func(args, sample, **kwargs):
     """Tool call reward function using math_dapo as primary reward model"""
@@ -484,13 +498,10 @@ async def reward_func(args, sample, **kwargs):
         debug_dict["group_index"] = sample.group_index
         debug_dict["label"] = sample.label
 
-
         rank = int(os.environ.get("RANK", 0))
         if args.output_sample_file:
             if sample.status != Sample.Status.ABORTED:
-                with open(args.output_sample_file+f"/{rank}.jsonl", "a") as dump_file:
-                    dump_file.write(
-                        json.dumps(sample.debug_dict, indent=2) + "\n"
-                    )
+                with open(args.output_sample_file + f"/{rank}.jsonl", "a") as dump_file:
+                    dump_file.write(json.dumps(sample.debug_dict, indent=2) + "\n")
     # WARNING: needs to check float or dict is the correct format
     return result
