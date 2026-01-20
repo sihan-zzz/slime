@@ -366,6 +366,7 @@ def train_one_step(
                 "advantages",
                 "returns",
                 "rollout_log_probs",
+                "truncated",
             ],
             args.data_pad_size_multiplier,
         )

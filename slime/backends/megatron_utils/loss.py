@@ -352,6 +352,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             advantages = list(torch.split(whitened_advs_flat, chunk_lengths))
 
     rollout_data["advantages"] = advantages
+    rollout_data["advantages_abs"] = [adv.abs() for adv in advantages]
     rollout_data["returns"] = returns
 
 
@@ -507,7 +508,7 @@ def policy_loss_function(
         loss += 0 * logits.sum()
 
     train_rollout_logprob_abs_diff = None
-    if "rollout_log_probs" in batch:
+    if batch.get("rollout_log_probs"):
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
 

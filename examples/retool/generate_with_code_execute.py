@@ -1,4 +1,5 @@
 # Adapted from https://github.com/volcengine/verl/blob/cb809d66e46dfd3342d008628891a14a054fa424/recipe/retool/retool.py
+import os
 import re
 from typing import Any, Dict, List, Optional, Union
 import json
@@ -12,7 +13,9 @@ from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
 from slime.utils.misc import print_eval
+import logging
 
+logger: logging.Logger = logging.getLogger(__name__)
 # Import reward models
 try:
     from slime.rollout.rm_hub.math_dapo_utils import last_boxed_only_string, remove_boxed
@@ -23,7 +26,7 @@ except ImportError:
 from tool_sandbox import SEMAPHORE, TOOL_CONFIGS, tool_registry
 
 # Jinja2 template for tool-enabled conversations
-TOOL_TEMPLATE = """<|im_start|>system
+TOOL_TEMPLATE = """<|im_start|>system\n
 {%- if messages[0]['role'] == 'system' %}
 {{- messages[0]['content'] }}
 {%- else %}
@@ -32,31 +35,24 @@ You are a helpful assistant.
 {%- if tools %}
 # Tools
 
-You may call one or more functions to assist with the user query.
-
-You are provided with function signatures within <tools></tools> XML tags:
-<tools>
-{%- for tool in tools %}
-{{- tool | tojson }}
-{%- endfor %}
-</tools>
-
-For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+To use python execution env, return a json object with function name and arguments 
+within <tool_call></tool_call> XML tags:
 <tool_call>
-{"name": <function-name>, "arguments": <args-json-object>}
-</tool_call>
+{"name": code_interpreter, "arguments": {"code": "your python code here", "stdin": "input to the code if any"}}
+</tool_call> \n
+This is a standard python env without third-party libraries or internet access. 
+Execution results will be returned within <interpreter></interpreter> XML tags.
+
 {%- endif %}
 <|im_end|>
 {%- for message in messages %}
 {%- if message['role'] == 'user' %}
-<|im_start|>user
-{{- message['content'] }}<|im_end|>
+{{- message['content'] }}
 {%- elif message['role'] == 'assistant' %}
 <|im_start|>assistant
 {{- message['content'] }}<|im_end|>
 {%- endif %}
 {%- endfor %}
-<|im_start|>assistant
 """
 
 
@@ -74,10 +70,14 @@ def format_conversation_with_tools(
         system_content = system_prompt
     else:
         system_content = (
-        "You are a program solution verifier that can use Python "
-        "tools to verify whether a program is a correct solution to a coding problem. "
-        "Use the code_interpreter tool when necessary to run any code needed for verification."
-    )
+            " You are a program solution verifier that can use Python "
+            "tools to verify whether a program is a correct solution to a coding problem. "
+            "Instructions: "
+            "1. Use the code_interpreter tool when necessary to run any code needed for verification"
+            "2. Think about edge case test inputs that can help verify the correctness of the solution."
+            "3. If the code uses libraries that are not available in the code interpreter, "
+            "just reason about the code without executing it."
+        )
 
     messages_to_render.append({"role": "system", "content": system_content})
 
@@ -95,7 +95,9 @@ def format_conversation_with_tools(
     return formatted_text
 
 
-def postprocess_predictions(prediction: str) -> tuple[Optional[str], Union[str, Dict[str, Any], List[tuple[str, Dict[str, Any]]]]]:
+def postprocess_predictions(
+    prediction: str,
+) -> tuple[Optional[str], Union[str, Dict[str, Any], List[tuple[str, Dict[str, Any]]]]]:
     """Extract actions and content (supports multiple <tool_call> blocks)"""
     # 1. Check for Answer:\boxed{...}
     answer_pattern = r"Answer:\s*\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
@@ -145,10 +147,10 @@ def postprocess_predictions(prediction: str) -> tuple[Optional[str], Union[str, 
 def postprocess_responses(resp: str) -> str:
     """Post-process response to ensure tag completeness"""
 
-    # BOB: in qwen3-8b and above, the model generates thinkings and needs to get rid of it
-    marker="</think>"
-    if marker in resp:
-        resp = resp.split(marker)[-1]
+    # # BOB: in qwen3-8b and above, the model generates thinkings and needs to get rid of it
+    # marker="</think>"
+    # if marker in resp:
+    #     resp = resp.split(marker)[-1]
 
     # Handle <tool_call> tags (new format from Jinja2 template)
     if "<tool_call>" in resp:
@@ -184,7 +186,7 @@ def postprocess_responses(resp: str) -> str:
     return resp
 
 
-async def execute_predictions(prediction: str, max_tools_calls_per_turn = 4) -> str:
+async def execute_predictions(prediction: str, max_tools_calls_per_turn=4) -> str:
     """Execute predictions and return results"""
     action, content = postprocess_predictions(prediction)
 
@@ -231,11 +233,11 @@ async def execute_predictions(prediction: str, max_tools_calls_per_turn = 4) -> 
         done = True
     else:
         next_obs = (
-            "\nMy previous action is invalid. "
-            "If I want to execute code, I should put the code between "
-            "<code> and </code>. "
-            "If I want to give the final answer, I should use the format "
-            "'Answer: \\boxed{answer}'. Let me try again.\n"
+            "\nYour previous action is invalid. "
+            "If You want to execute code, you should put the code between "
+            "<tool_call> and </tool_call>. "
+            "If You want to give the final answer, you should use the format "
+            "'Answer: \\boxed{answer}'. Try again.\n"
         )
         done = False
 
@@ -245,27 +247,29 @@ async def execute_predictions(prediction: str, max_tools_calls_per_turn = 4) -> 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     """Custom generation function supporting tool calls"""
     assert not args.partial_rollout, "Partial rollout is not supported for " "this function at the moment."
-    assert sample is not None and isinstance(sample, Sample), "Sample must be provided and be an instance of Sample class."
+    assert sample is not None and isinstance(
+        sample, Sample
+    ), "Sample must be provided and be an instance of Sample class."
 
     print_eval(f"=== New Sample Index {sample.index} ===")
     print_eval("starting generation...")
     prompt = sample.prompt
-
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     # Set up the initial prompt with system prompt and tools (outside the loop)
     tool_specs = tool_registry.get_tool_specs()
     prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
-
     prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
     response = ""
     response_token_ids = []
     loss_masks = []
     tool_call_count = 0  # Track actual tool call rounds
     output = None
-
+    results = {"prompt": prompt, "index": sample.index}
+    # logger.info(f"zzzzlog in customized generate {TOOL_CONFIGS["max_turns"]}")
     for turn in range(TOOL_CONFIGS["max_turns"]):
+        results[turn] = {}
         print_eval(f"=== Turn {turn} ===")
         print_eval(f"response so far: {response}")
 
@@ -289,7 +293,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             sample.status = Sample.Status.TRUNCATED
             print_eval("Context length limit reached, stopping generation.")
             break
-            
+
         # Simple: just send prompt + response
         payload = {
             "text": prompt + response,
@@ -300,19 +304,15 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         # Log payload to wandb for debugging
         try:
             import wandb
-            import weave
 
             if wandb.run is not None:
-                # Count available tools (from tool_specs)
-                available_tools = len(tool_specs)
                 # Count tools used in the current response
                 tools_used = response.count("<interpreter>")
 
                 wandb.log(
-                    {   
+                    {
                         "debug/payload_length": len(prompt + response),
                         "debug/num_token": len(state.tokenizer(prompt + response)["input_ids"]),
-                        "debug/available_tools": available_tools,
                         "debug/tools_used": tools_used,
                         "debug/turn": turn,
                     }
@@ -327,32 +327,54 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             sample.status = Sample.Status.ABORTED
             return sample
 
+        is_truncated = output["meta_info"]["finish_reason"]["type"] == "length"
         cur_response = output["text"]
-        cur_response = postprocess_responses(cur_response)
+
+        results[turn]["cur_response"] = cur_response
+        results[turn]["cur_response_string_len"] = len(cur_response)
+
         print_eval(f"====== Post-processed cur_response ======: {cur_response}")
 
         # Record current response tokens
         cur_response_token_ids = state.tokenizer(cur_response, add_special_tokens=False)["input_ids"]
+        results[turn]["cur_response_processed_token_len"] = len(cur_response_token_ids)
         response += cur_response
         response_token_ids += cur_response_token_ids
-        loss_masks += [1] * len(cur_response_token_ids)
-
+        loss_masks += [1 if not is_truncated else 0] * len(
+            cur_response_token_ids
+        )  # turn off loss on truncated examples
+        results[turn]["finish_reason"] = output["meta_info"]["finish_reason"]["type"]
         # Check length limit
         if output["meta_info"]["finish_reason"]["type"] == "length":
             print_eval("Length limit reached during generation.")
             break
 
-        next_obs, done = await execute_predictions(cur_response, max_tools_calls_per_turn=TOOL_CONFIGS["max_tool_calls_per_turn"])
+        next_obs, done = await execute_predictions(
+            cur_response, max_tools_calls_per_turn=TOOL_CONFIGS["max_tool_calls_per_turn"]
+        )
+
+        if len(next_obs) > 5000:
+            next_obs = next_obs[:5000] + "[Truncated]"
         print_eval(f"Next observation: {next_obs}")
         print_eval(f"Done: {done}")
         if done:
+            results[turn]["ob"] = next_obs
+            results[turn]["done"] = done
             break
+        elif turn == TOOL_CONFIGS["max_turns"] - 1:
+            next_obs = f"<|im_start|>tools {next_obs} \n max amount of tool calls reached, think and give your answer. <|im_end|><|im_start|> assistant"
+            results[turn]["ob"] = next_obs
+            results[turn]["done"] = done
+        else:
+            next_obs = f"<|im_start|>tools {next_obs} \n given above tool call results, think and decide if you need to call any tools or give answer directly. <|im_end|><|im_start|> assistant"
+            results[turn]["ob"] = next_obs
+            results[turn]["done"] = done
 
         # Count tool calls (when we get interpreter output, it means a tool
         # was called)
         if "<interpreter>" in next_obs:
             tool_call_count += 1
-
+        results[turn]["tool_call_count"] = tool_call_count
         assert next_obs != "", "Next observation should not be empty."
         obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
         print_eval(f"before obs, response is now: {response}")
@@ -391,6 +413,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         case "stop":
             sample.status = Sample.Status.COMPLETED
 
+    sample.debug_dict = results
     return sample
 
 
@@ -426,12 +449,13 @@ def compute_score(
     reward = 1.0 if correct else -1.0
     # acc = correct
     result = {
-        "score": reward, # int
-        "pred": pred, # int
-        "gt": ground_truth, # int
+        "score": reward,  # int
+        "pred": pred,  # int
+        "gt": ground_truth,  # int
     }
 
     return result
+
 
 async def reward_func(args, sample, **kwargs):
     """Tool call reward function using math_dapo as primary reward model"""
@@ -443,9 +467,14 @@ async def reward_func(args, sample, **kwargs):
 
     # Get ground truth answer - label is a string, not a dict
     ground_truth = sample.label if sample.label is not None else ""
-
     # use \\boxed{...} answer
     result = compute_score(solution_str, ground_truth, strict_box_verify=True)
+    # logger.info(f"zzzzlog grading {result=}, on {solution_str[-100:]=} against {ground_truth=}")
+
+    debug_dict = sample.debug_dict
+    if debug_dict is not None:
+        debug_dict["score_result"] = result
+        debug_dict["group_index"] = sample.group_index
 
     # WARNING: needs to check float or dict is the correct format
     return result

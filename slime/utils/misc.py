@@ -6,6 +6,14 @@ import ray
 
 from slime.utils.http_utils import is_port_available
 
+opt_print=False
+
+def print_eval(str: str):
+    if not opt_print:
+        return
+    with open("eval_output.txt", "a") as f:
+        f.write(str + "\n")
+
 
 def load_function(path):
     """
@@ -16,6 +24,7 @@ def load_function(path):
     module_path, _, attr = path.rpartition(".")
     module = importlib.import_module(module_path)
     return getattr(module, attr)
+
 
 
 class SingletonMeta(type):

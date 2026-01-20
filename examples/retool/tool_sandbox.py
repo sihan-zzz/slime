@@ -20,11 +20,12 @@ import psutil
 
 # Configuration for tool execution
 TOOL_CONFIGS = {
-    "max_turns": 16,
-    "max_tool_calls": 16,
+    "max_turns": int(os.getenv("MAX_TURNS", 4)),
+    # "max_tool_calls": int(os.getenv("MAX_TOOL_CALLS", 4)),
+    "max_tool_calls_per_turn": int(os.getenv("MAX_TOOL_CALLS_PER_TURN", 4)), # Limit tool calls per turn
     "tool_concurrency": 32,  # Aggressive: 32 concurrent processes
     # Python interpreter settings
-    "python_timeout": 120,  # 2 minutes for complex calculations
+    "python_timeout": 5,  # 5 seconds per code execution
     "python_memory_limit": "4GB",  # 4GB per Python process
     "python_cpu_limit": 1,
     # Memory management settings
@@ -98,25 +99,17 @@ class PythonSandbox:
     def __init__(self, timeout: int = 10, memory_limit: str = "100MB"):
         self.timeout = timeout
         self.memory_limit = memory_limit
-        self.allowed_modules = {
-            "math",
-            "random",
-            "datetime",
-            "collections",
-            "itertools",
-            "functools",
-            "operator",
-            "statistics",
-            "decimal",
-            "fractions",
+
+        # allowed modules is too strict
+        self.not_allowed_modules = {
         }
 
     def _check_code_safety(self, code: str) -> tuple[bool, str]:
         """Check code safety by scanning for dangerous patterns"""
         # Check for dangerous operations
         dangerous_patterns = [
-            r"import\s+os",
-            r"import\s+sys",
+            # r"import\s+os",
+            # r"import\s+sys",
             r"import\s+subprocess",
             r"import\s+shutil",
             r"import\s+glob",
@@ -125,11 +118,11 @@ class PythonSandbox:
             r"eval\s*\(",
             r"exec\s*\(",
             r"open\s*\(",
-            r"file\s*\(",
-            r"input\s*\(",
-            r"raw_input\s*\(",
+            # r"file\s*\(",
+            # r"input\s*\(",
+            # r"raw_input\s*\(",
             r"compile\s*\(",
-            r"execfile\s*\(",
+            # r"execfile\s*\(",
             r"getattr\s*\(",
             r"setattr\s*\(",
             r"delattr\s*\(",
@@ -138,14 +131,14 @@ class PythonSandbox:
             r"locals\s*\(",
             r"vars\s*\(",
             r"dir\s*\(",
-            r"type\s*\(",
-            r"isinstance\s*\(",
-            r"issubclass\s*\(",
-            r"super\s*\(",
+            # r"type\s*\(",
+            # r"isinstance\s*\(",
+            # r"issubclass\s*\(",
+            # r"super\s*\(",
             r"property\s*\(",
-            r"staticmethod\s*\(",
-            r"classmethod\s*\(",
-            r"__\w+__",  # double underscore methods
+            # r"staticmethod\s*\(",
+            # r"classmethod\s*\(",
+            # r"__\w+__",  # double underscore methods
         ]
 
         for pattern in dangerous_patterns:
@@ -161,7 +154,7 @@ class PythonSandbox:
 
         all_imports = set(imports + froms)
         for imp in all_imports:
-            if imp not in self.allowed_modules:
+            if imp in self.not_allowed_modules:
                 return False, f"Import of '{imp}' is not allowed"
 
         return True, "Code is safe"
@@ -192,7 +185,7 @@ class PythonSandbox:
             except Exception:
                 pass
 
-    async def execute_code(self, code: str) -> str:
+    async def execute_code(self, code: str, stdin: str | None = None) -> str:
         """Execute Python code in sandbox with safety checks"""
         # Check memory usage before execution
         current_memory = get_memory_usage()
@@ -266,10 +259,12 @@ except Exception as e:
 
             try:
                 # Use subprocess to run code
+                stdin_arg = subprocess.PIPE if stdin is not None else None
                 process = subprocess.Popen(
                     ["python3", script_path],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    stdin=stdin_arg,
                     env=env,
                     cwd=temp_dir,
                     text=True,
@@ -277,7 +272,11 @@ except Exception as e:
 
                 # Set timeout
                 try:
-                    stdout, stderr = process.communicate(timeout=self.timeout)
+                    if stdin is not None:
+                        input_data = stdin if stdin != "" else "\n"
+                        stdout, stderr = process.communicate(input=input_data, timeout=self.timeout)
+                    else:
+                        stdout, stderr = process.communicate(timeout=self.timeout)
 
                     if process.returncode == 0:
                         result = stdout.strip()
@@ -321,8 +320,11 @@ class ToolRegistry:
                     "description": "A tool for executing Python code in a safe sandbox environment.",
                     "parameters": {
                         "type": "object",
-                        "properties": {"code": {"type": "string", "description": "The Python code to execute"}},
-                        "required": ["code"],
+                        "properties": {
+                            "code": {"type": "string", "description": "The Python code to execute"},
+                            "stdin": {"type": "string", "description": "Required standard input to pass. Use \"\" for a blank line"},
+                        },
+                        "required": ["code","stdin"],
                     },
                 },
             },
@@ -354,7 +356,8 @@ class ToolRegistry:
             return "Error: No code provided"
 
         # Execute code in sandbox
-        result = await self.python_sandbox.execute_code(code)
+        stdin_value = arguments.get("stdin", arguments.get("input", None))
+        result = await self.python_sandbox.execute_code(code, stdin=stdin_value)
         return result
 
 

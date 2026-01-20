@@ -125,7 +125,15 @@ def train(args):
 
     ray.get(rollout_manager.dispose.remote())
 
+def add_custom_args(parser):
+    parser.add_argument(
+        "--output_sample_file",
+        type=str,
+        default="",
+        help="Path to local file to store generations",
+    )
+    return parser
 
 if __name__ == "__main__":
-    args = parse_args()
+    args = parse_args(add_custom_args)
     train(args)
