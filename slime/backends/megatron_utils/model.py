@@ -370,6 +370,7 @@ def train_one_step(
                 "returns",
                 "rollout_log_probs",
                 "max_seq_lens",
+                "truncated",
             ],
             args.data_pad_size_multiplier,
             args.qkv_format,
@@ -515,7 +516,7 @@ def train(
         num_microbatches (Sequence[int]): Microbatches per step in the rollout.
     """
     args = get_args()
-
+    logger.info("zzzzlog entering megatron train")
     for iterator in data_iterator:
         iterator.reset()
 
@@ -584,9 +585,10 @@ def train(
 
     num_steps_per_rollout = len(num_microbatches)
 
+    logger.info(f"zzzzlog before entering {num_steps_per_rollout=}")
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
-
+        logger.info(f"zzzzlog training {step_id=}")
         # Run training step.
         loss_dict, grad_norm = train_one_step(
             args,

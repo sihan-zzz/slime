@@ -4,7 +4,8 @@ from slime.ray.placement_group import create_placement_groups, create_rollout_ma
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.misc import should_run_periodic_action
-
+import logging
+logger = logging.getLogger(__name__)
 
 def train(args):
     configure_logger()
@@ -67,6 +68,7 @@ def train(args):
             ray.get(rollout_manager.eval.remote(rollout_id))
 
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
+        logger.info(f"zzzzlog {rollout_id=}, rollout data done")
 
         if args.offload_rollout:
             ray.get(rollout_manager.offload.remote())
@@ -78,6 +80,7 @@ def train(args):
             ray.get(critic_train_handle)
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+        logger.info(f"zzzzlog {rollout_id=}, async training done")
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             save(rollout_id)
@@ -91,10 +94,35 @@ def train(args):
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))
+            logger.info(f"zzzzlog {rollout_id=}, eval done with freq {args.eval_interval=}")
 
     ray.get(rollout_manager.dispose.remote())
 
 
+def add_custom_args(parser):
+    parser.add_argument(
+        "--output_sample_file",
+        type=str,
+        default="",
+        help="Path to local file to store generations",
+    )
+    parser.add_argument(
+        "--no_loss_on_truncated",
+        action="store_true",
+        help="Whether to ignore loss on truncated examples",
+    )
+    parser.add_argument(
+        "--save-eval-debug-rollout-data",
+        type=str,
+        default=None,
+        help=(
+            "Save the eval rollout data to this path for debugging. "
+            "The file will be saved to `save_eval_debug_rollout_data.format(eval_dataset_name, rollout_id)`."
+        ),
+    )
+    return parser
+
+
 if __name__ == "__main__":
-    args = parse_args()
+    args = parse_args(add_custom_args)
     train(args)

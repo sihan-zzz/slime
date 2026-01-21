@@ -343,7 +343,9 @@ def get_data_iterator(
                     partitions[j][k] += start
             micro_batch_indices.extend(partitions)
 
-        assert len(set(sum(micro_batch_indices, []))) == num_local_samples
+        assert (
+            len(set(sum(micro_batch_indices, []))) == num_local_samples
+        ), f"num_local_sample is of size[{num_local_samples}], micro_batch_indices of [{len(set(sum(micro_batch_indices, [])))}]"
 
         data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices)
 
@@ -380,6 +382,7 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
+                "truncated",
             ]:
                 continue
             # Upload per sample mean for each rollout value
@@ -390,7 +393,15 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                     # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
                     # modified in place and will cause problem for the next rollout.
                     val = torch.cat(val).clone().detach()
-                    if key in ["log_probs", "ref_log_probs", "rollout_log_probs", "returns", "advantages", "values"]:
+                    if key in [
+                        "log_probs",
+                        "ref_log_probs",
+                        "rollout_log_probs",
+                        "returns",
+                        "advantages",
+                        "values",
+                        "advantages_abs",
+                    ]:
                         sum_of_sample_mean = get_sum_of_sample_mean(
                             total_lengths,
                             response_lengths,

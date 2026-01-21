@@ -2,6 +2,8 @@ import asyncio
 import copy
 import inspect
 import logging
+import json
+import os
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -355,12 +357,19 @@ async def generate_rollout_async(
 
     # target_data_size is the total number of valid samples to get
     target_data_size = args.rollout_batch_size
+    target_split_data_size = target_data_size / 2
 
-    data = []
     all_data = []
+    pos_data = []
+    neg_data = []
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
-    while len(data) < target_data_size:
+
+    logger.info(
+        f"zzzzlog Starting rollout: {args.rollout_batch_size=}, {args.n_samples_per_prompt=}, {(target_data_size * args.n_samples_per_prompt)=}",
+    )
+    scores = []
+    while len(pos_data) + len(neg_data) < target_data_size:
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
@@ -368,7 +377,7 @@ async def generate_rollout_async(
 
         # wait for the generation to finish
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
+        for i, task in enumerate(done):
             group: list[Sample] = task.result()
 
             if do_print:
@@ -380,6 +389,7 @@ async def generate_rollout_async(
 
             assert len(group) == args.n_samples_per_prompt
             all_data.append(group)
+            scores.append(sum([sample.get_reward_value(args) for sample in group]) / args.n_samples_per_prompt)
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             if not dynamic_filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
@@ -388,16 +398,44 @@ async def generate_rollout_async(
 
             # add the samples to the data
             # NOTE: here we have not stored all the unused samples back to the data buffer.
-            if len(data) < target_data_size:
-                data.append(group)
-                pbar.update(args.n_samples_per_prompt)
+
+            # keep positive and negative balancedly
+            group_label = group[0].label
+            if group_label > 0.5:
+                if len(pos_data) < target_split_data_size:
+                    pos_data.append(group)
+                    pbar.update(args.n_samples_per_prompt)
+                else:
+                    state.remaining_batch_size -= 1
+            else:
+                if len(neg_data) < target_split_data_size:
+                    neg_data.append(group)
+                    pbar.update(args.n_samples_per_prompt)
+                else:
+                    state.remaining_batch_size -= 1
 
     pbar.close()
+    data = pos_data + neg_data
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(
         f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
     )
-
+    positive_batch = sum(group[0].label > 0.5 for group in data)
+    negative_batch = sum(group[0].label < 0.5 for group in data)
+    logger.info(
+        f"zzzzlog rollout_id={rollout_id} getting {len(data)} batches, each batch of {len(data[0])} responses, "
+        f"{positive_batch=} positive, {negative_batch=} negative"
+    )
+    adhoc_metric_dict = {
+        "rollout/dynamic_filter/remain_positive_ratio": (
+            positive_batch / (positive_batch + negative_batch) if (positive_batch + negative_batch) > 0 else 0.0
+        ),
+        "rollout/avg_tool_call_count": sum(sample.tool_call_count for group in data for sample in group)
+        / (len(data) * args.n_samples_per_prompt),
+        "rollout/avg_turns": sum(sample.turn_finished for group in data for sample in group)
+        / (len(data) * args.n_samples_per_prompt),
+        "rollout/avg_reward_before_filter": sum(scores) / len(scores),
+    }
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)
 
@@ -406,6 +444,16 @@ async def generate_rollout_async(
     all_samples = sorted(
         all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index
     )
+
+    # only write out completed and truncated samples
+    rank = int(os.environ.get("RANK", 0))
+    if args.output_sample_file:
+        with open(args.output_sample_file + f"/rank_{rank}_rollout_{rollout_id}.jsonl", "a") as dump_file:
+            for prompts in data:
+                for sample in prompts:
+                    dump_dict = sample.debug_dict if sample.debug_dict is not None else {}
+                    dump_dict["rollout_id"] = rollout_id
+                    dump_file.write(json.dumps(dump_dict, ensure_ascii=True) + "\n")
 
     # reset the global state to prevent effects on the next rollout or eval.
     state.reset()
@@ -418,7 +466,7 @@ async def generate_rollout_async(
         process_func = load_function(args.rollout_all_samples_process_path)
         process_func(args, all_samples, data_source)
 
-    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
+    return RolloutFnTrainOutput(samples=data, metrics={**metric_gatherer.collect(), **adhoc_metric_dict}), aborted_samples
 
 
 EVAL_PROMPT_DATASET = {}
@@ -530,15 +578,60 @@ async def eval_rollout_single_dataset(
     data.sort(key=lambda sample: sample.index)
 
     reward_key = args.eval_reward_key or args.reward_key
+
+    # TODO (Bob): needs to add a utility function or organize this function better. only temp for now
+    tp = sum(
+        1
+        for sample in data
+        if "pred" in sample.reward and "gt" in sample.reward
+        and sample.reward["pred"] == 1 and sample.reward["gt"] == 1 and not sample.status == Sample.Status.TRUNCATED
+    )
+    tn = sum(
+        1
+        for sample in data
+        if "pred" in sample.reward and "gt" in sample.reward
+        and sample.reward["pred"] == 0 and sample.reward["gt"] == 0 and not sample.status == Sample.Status.TRUNCATED
+    )
+    fp = sum(
+        1
+        for sample in data
+        if "pred" in sample.reward and "gt" in sample.reward
+        and sample.reward["pred"] == 1 and sample.reward["gt"] == 0 and not sample.status == Sample.Status.TRUNCATED
+    )
+    fn = sum(
+        1
+        for sample in data
+        if "pred" in sample.reward and "gt" in sample.reward
+        and sample.reward["pred"] == 0 and sample.reward["gt"] == 1 and not sample.status == Sample.Status.TRUNCATED
+    )
+
+    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    tnr = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    num_none = sum(1 for sample in data if sample.reward["pred"] is None)
+    average_response_length = sum(sample.response_length for sample in data if not sample.status == Sample.Status.TRUNCATED) / len(data)
+    average_tool_call_count = sum(sample.tool_call_count for sample in data if not sample.status == Sample.Status.TRUNCATED) / len(data)
+    average_turn_finished = sum(sample.turn_finished for sample in data if not sample.status == Sample.Status.TRUNCATED) / len(data)
     return {
         dataset_cfg.name: {
             "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
+            "accuracy": accuracy,
+            "recall": recall,
+            "precision": precision,
+            "tnr": tnr,
+            "f1": f1,
+            "ratio_none": num_none / len(data),
+            "average_response_length": average_response_length,
+            "average_tool_call_count": average_tool_call_count,
+            "average_turn_finished": average_turn_finished,
         }
     }
 
-
+# BOB: this is the rollout function as default
 def generate_rollout(
     args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False
 ) -> RolloutFnTrainOutput | RolloutFnEvalOutput:

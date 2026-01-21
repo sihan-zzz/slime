@@ -1,0 +1,476 @@
+# Adapted from https://github.com/volcengine/verl/blob/cb809d66e46dfd3342d008628891a14a054fa424/recipe/retool/retool.py
+import os
+import re
+from typing import Any, Dict, List, Optional, Union
+import json
+
+try:
+    from jinja2 import Template
+except ImportError:
+    raise ImportError("Jinja2 is required. Please install it with: pip install jinja2")
+
+from slime.rollout.sglang_rollout import GenerateState
+from slime.utils.http_utils import post
+from slime.utils.types import Sample
+import logging
+
+logger: logging.Logger = logging.getLogger(__name__)
+# Import reward models
+try:
+    from slime.rollout.rm_hub.math_dapo_utils import last_boxed_only_string, remove_boxed
+except ImportError:
+    raise ImportError("MathDapo is not installed")
+
+# Import tool sandbox functionality
+from tool_sandbox import SEMAPHORE, TOOL_CONFIGS, tool_registry
+
+# Jinja2 template for tool-enabled conversations
+TOOL_TEMPLATE = """<|im_start|>system\n
+{%- if messages[0]['role'] == 'system' %}
+{{- messages[0]['content'] }}
+{%- else %}
+You are a helpful assistant.
+{%- endif %}
+{%- if tools %}
+# Tools
+
+To use python execution env, return a json object with function name and arguments 
+within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": code_interpreter, "arguments": {"code": "your python code here", "stdin": "input to the code if any"}}
+</tool_call> \n
+This is a standard python env without third-party libraries or internet access. 
+Execution results will be returned within <interpreter></interpreter> XML tags.
+
+{%- endif %}
+<|im_end|>
+{%- for message in messages %}
+{%- if message['role'] == 'user' %}
+{{- message['content'] }}
+{%- elif message['role'] == 'assistant' %}
+<|im_start|>assistant
+{{- message['content'] }}<|im_end|>
+{%- endif %}
+{%- endfor %}
+"""
+
+
+def format_conversation_with_tools(
+    prompt: str, tools: List[Dict[str, Any]] = None, system_prompt: str = None, messages: List[Dict[str, Any]] = None
+) -> str:
+    """Format conversation using Jinja2 template with tool support"""
+    template = Template(TOOL_TEMPLATE)
+
+    # Prepare messages
+    messages_to_render = []
+
+    # Always add system message - use provided one or default
+    if system_prompt:
+        system_content = system_prompt
+    else:
+        system_content = (
+            # "You are a program solution verifier that can verify whether a program is a correct solution to a coding problem. "
+            " You are a program solution verifier that can use Python "
+            "tools to verify whether a program is a correct solution to a coding problem. "
+            "Instructions: "
+            "1. Use the code_interpreter tool when necessary to run any code needed for verification"
+            "2. Think about edge case test inputs that can help verify the correctness of the solution."
+            "3. If the code uses libraries that are not available in the code interpreter, "
+            "just reason about the code without executing it."
+        )
+
+    messages_to_render.append({"role": "system", "content": system_content})
+
+    # Add user message if provided
+    if prompt:
+        messages_to_render.append({"role": "user", "content": prompt})
+
+    # Add assistant responses from previous turns if provided
+    if messages:
+        messages_to_render.extend(messages)
+
+    # Render template
+    formatted_text = template.render(messages=messages_to_render, tools=tools or [])
+
+    return formatted_text
+
+
+def postprocess_predictions(
+    prediction: str,
+) -> tuple[Optional[str], Union[str, Dict[str, Any], List[tuple[str, Dict[str, Any]]]]]:
+    """Extract actions and content (supports multiple <tool_call> blocks)"""
+    # 1. Check for Answer:\boxed{...}
+    answer_pattern = r"Answer:\s*\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
+    answer_match = re.search(answer_pattern, prediction, re.DOTALL)
+    if answer_match:
+        return "answer", answer_match.group(1).strip()
+
+    # 2. Check for one or more <tool_call> blocks
+    tool_call_pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
+    tool_call_matches = re.findall(tool_call_pattern, prediction, re.DOTALL)
+
+    if tool_call_matches:
+        results = []
+        for json_str in tool_call_matches:
+            try:
+                json_str = json_str.replace("\n", "\\n")
+                tool_call_data = json.loads(json_str)
+                tool_name = tool_call_data.get("name")
+                arguments = tool_call_data.get("arguments", {})
+
+                if tool_name == "code_interpreter":
+                    code = arguments.get("code", "").strip()
+                    stdin_value = arguments.get("stdin", arguments.get("input", None))
+                    if code:
+                        results.append(("code", {"code": code, "stdin": stdin_value}))
+            except (json.JSONDecodeError, KeyError, AttributeError):
+                continue
+
+        # If multiple tool calls were found, return all of them
+        if results:
+            return "multi_code", results
+        # Otherwise, fall through
+
+    # 3. <code>...</code>
+    code_match = re.search(r"<code>(.*?)</code>", prediction, re.DOTALL)
+    if code_match:
+        return "code", {"code": code_match.group(1).strip(), "stdin": None}
+
+    # 4. ```python ... ```
+    python_code_match = re.search(r"```python\s*(.*?)\s*```", prediction, re.DOTALL)
+    if python_code_match:
+        return "code", {"code": python_code_match.group(1).strip(), "stdin": None}
+
+    return None, ""
+
+
+def postprocess_responses(resp: str) -> str:
+    """Post-process response to ensure tag completeness"""
+
+    # # BOB: in qwen3-8b and above, the model generates thinkings and needs to get rid of it
+    # marker="</think>"
+    # if marker in resp:
+    #     resp = resp.split(marker)[-1]
+
+    # Handle <tool_call> tags (new format from Jinja2 template)
+    if "<tool_call>" in resp:
+        # Find the last occurrence of <tool_call>...</tool_call>
+        tool_call_pattern = r"<tool_call>\s*\{.*?\}\s*</tool_call>"
+        matches = list(re.finditer(tool_call_pattern, resp, re.DOTALL))
+        if matches:
+            last_match = matches[-1]
+            return resp[: last_match.end()]
+
+    # Handle <code> tags
+    if "</code>" in resp:
+        return resp.split("</code>")[0] + "</code>"
+
+    # Handle ```python code blocks
+    if "```python" in resp:
+        # Find the last occurrence of ```python...```
+        python_pattern = r"```python\s*.*?```"
+        matches = list(re.finditer(python_pattern, resp, re.DOTALL))
+        if matches:
+            last_match = matches[-1]
+            return resp[: last_match.end()]
+
+    # Handle Answer: \boxed{...} format (only format we need for math_dapo)
+    if "Answer:" in resp and "\\boxed{" in resp:
+        # Find the last occurrence of Answer: \boxed{...} with nested braces support
+        answer_pattern = r"Answer:\s*\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
+        matches = list(re.finditer(answer_pattern, resp, re.DOTALL))
+        if matches:
+            last_match = matches[-1]
+            return resp[: last_match.end()]
+
+    return resp
+
+
+async def execute_predictions(prediction: str, max_tools_calls_per_turn=4) -> str:
+    """Execute predictions and return results"""
+    action, content = postprocess_predictions(prediction)
+
+    if action == "code":
+        # Content is already the Python code (extracted by
+        # postprocess_predictions)
+        code = content["code"].strip() if isinstance(content, dict) else str(content).strip()
+        stdin_value = content.get("stdin") if isinstance(content, dict) else None
+        if code:
+            # TODO BOB: this will create a deadlock!!!
+            async with SEMAPHORE:
+                args = {"code": code}
+                if stdin_value is not None:
+                    args["stdin"] = stdin_value
+                result = await tool_registry.execute_tool("code_interpreter", args)
+
+            next_obs = f"\n\n<interpreter>\n{result}\n</interpreter>\n\n"
+            done = False
+        else:
+            next_obs = "\n\n<interpreter>\nError: No Python code found" "\n</interpreter>\n\n"
+            done = False
+    elif action == "multi_code":
+        # only execute up to max_tools_calls_per_turn
+        results = []
+        for i, (act, cont) in enumerate(content):
+            if i >= max_tools_calls_per_turn:
+                break
+            if act == "code":
+                code = cont["code"].strip() if isinstance(cont, dict) else str(cont).strip()
+                stdin_value = cont.get("stdin") if isinstance(cont, dict) else None
+                if code:
+                    async with SEMAPHORE:
+                        args = {"code": code}
+                        if stdin_value is not None:
+                            args["stdin"] = stdin_value
+                        result = await tool_registry.execute_tool("code_interpreter", args)
+                    results.append(f"<interpreter>\n{result}\n</interpreter>")
+                else:
+                    results.append("<interpreter>\nError: No Python code found\n</interpreter>")
+        next_obs = "\n\n".join(results) + "\n\n"
+        done = False
+    elif action == "answer":
+        next_obs = ""
+        done = True
+    else:
+        next_obs = (
+            "\nYour previous action is invalid. "
+            "If You want to execute code, you should put the code between "
+            "<tool_call> and </tool_call>. "
+            "If You want to give the final answer, you should use the format "
+            "'Answer: \\boxed{answer}'. Try again.\n"
+        )
+        done = False
+
+    return next_obs, done
+
+
+async def generate(args, sample: Sample, sampling_params) -> Sample:
+    """Custom generation function supporting tool calls"""
+    assert not args.partial_rollout, "Partial rollout is not supported for " "this function at the moment."
+    assert sample is not None and isinstance(
+        sample, Sample
+    ), "Sample must be provided and be an instance of Sample class."
+    prompt = sample.prompt
+    state = GenerateState(args)
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+
+    # Set up the initial prompt with system prompt and tools (outside the loop)
+    tool_specs = tool_registry.get_tool_specs()
+    prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
+    prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    response = ""
+    response_token_ids = []
+    response_logprob = []
+    loss_masks = []
+    tool_call_count = 0  # Track actual tool call rounds
+    output = None
+    results = {"prompt": prompt, "index": sample.index}
+    # logger.info(f"zzzzlog in customized generate {TOOL_CONFIGS["max_turns"]}")
+    for turn in range(TOOL_CONFIGS["max_turns"]):
+        results[turn] = {}
+
+        # BOB: hardcoded otherwise https will complain and have no fallback and will cause program to abort
+        ctx_len = 40959
+        # if not ctx_len or ctx_len <= 0:
+        #     ctx_len = getattr(state.tokenizer, "model_max_length", 40960)
+
+        current_token_ids = prompt_tokens_ids + response_token_ids
+        current_len = len(current_token_ids)
+        allowed_new = max(0, ctx_len - current_len)
+
+        current_sampling_params = sampling_params.copy()
+        max_new = current_sampling_params.get("max_new_tokens", None)
+        if max_new is None:
+            current_sampling_params["max_new_tokens"] = allowed_new
+        else:
+            current_sampling_params["max_new_tokens"] = max(0, min(max_new, allowed_new))
+
+        if current_sampling_params["max_new_tokens"] == 0:
+            # No room to generate more tokens
+            sample.status = Sample.Status.TRUNCATED
+            break
+
+        # Simple: just send prompt + response
+        payload = {
+            "input_ids": current_token_ids,
+            "sampling_params": current_sampling_params,
+            "return_logprob": True,
+        }
+
+        # Log payload to wandb for debugging
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                # Count tools used in the current response
+                tools_used = response.count("<interpreter>")
+
+                wandb.log(
+                    {
+                        "debug/payload_length": len(current_token_ids),
+                        "debug/num_token": len(current_token_ids),
+                        "debug/tools_used": tools_used,
+                        "debug/turn": turn,
+                    }
+                )
+        except ImportError:
+            pass  # wandb not available
+
+        output = await post(url, payload)
+
+        # Handle abort
+        if output["meta_info"]["finish_reason"]["type"] == "abort":
+            sample.status = Sample.Status.ABORTED
+            return sample
+
+        new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+        new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+        is_truncated = output["meta_info"]["finish_reason"]["type"] == "length"
+        cur_response = state.tokenizer.decode(new_response_tokens, skip_special_tokens=False)
+
+        results[turn]["cur_response"] = cur_response
+        results[turn]["cur_response_string_len"] = len(cur_response)
+
+        # Record current response tokens directly from server output
+        cur_response_token_ids = new_response_tokens
+        results[turn]["cur_response_processed_token_len"] = len(cur_response_token_ids)
+        response += cur_response
+        response_token_ids += cur_response_token_ids
+        response_logprob += new_response_log_probs
+        if args.no_loss_on_truncated and is_truncated:
+            loss_masks += [0] * len(cur_response_token_ids)
+        else:
+            loss_masks += [1] * len(cur_response_token_ids)
+        results[turn]["finish_reason"] = output["meta_info"]["finish_reason"]["type"]
+        # Check length limit
+        if output["meta_info"]["finish_reason"]["type"] == "length":
+            break
+
+        next_obs, done = await execute_predictions(
+            cur_response, max_tools_calls_per_turn=TOOL_CONFIGS["max_tool_calls_per_turn"]
+        )
+
+        if len(next_obs) > 5000:
+            next_obs = next_obs[:5000] + "[Truncated]"
+        if done:
+            results[turn]["ob"] = next_obs
+            results[turn]["done"] = done
+            break
+        elif turn == TOOL_CONFIGS["max_turns"] - 1:
+            next_obs = f"<|im_start|>tools {next_obs} \n max amount of tool calls reached, think and give your answer. <|im_end|><|im_start|> assistant"
+            results[turn]["ob"] = next_obs
+            results[turn]["done"] = done
+        else:
+            next_obs = f"<|im_start|>tools {next_obs} \n given above tool call results, think and decide if you need to call any tools or give answer directly. <|im_end|><|im_start|> assistant"
+            results[turn]["ob"] = next_obs
+            results[turn]["done"] = done
+
+        # Count tool calls (when we get interpreter output, it means a tool
+        # was called)
+        if "<interpreter>" in next_obs:
+            tool_call_count += 1
+        results[turn]["tool_call_count"] = tool_call_count
+        assert next_obs != "", "Next observation should not be empty."
+        obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
+        response += next_obs
+        response_token_ids += obs_tokens_ids
+        response_logprob += [0.0] * len(obs_tokens_ids)  # No logprob for obs
+        loss_masks += [0] * len(obs_tokens_ids)
+
+        # Check if maximum tool call count reached
+        # if tool_call_count >= TOOL_CONFIGS["max_tool_calls"]:
+        #     break
+
+    # Set sample attributes
+    sample.tokens = prompt_tokens_ids + response_token_ids
+    sample.rollout_log_probs = response_logprob
+    sample.response_length = len(response_token_ids)
+    sample.response = response
+    sample.loss_masks = loss_masks
+
+    # Store payload information for wandb logging
+    sample.payload_text = prompt + response
+    sample.payload_has_system = "<|im_start|>system" in prompt + response
+    sample.payload_has_tools = "# Tools" in prompt + response
+
+    # Store tool call count for reward calculation
+    sample.tool_call_count = tool_call_count
+    sample.turn_finished = turn + 1
+
+    if output is None:
+        return sample
+
+    # Set status
+    match output["meta_info"]["finish_reason"]["type"]:
+        case "length":
+            sample.status = Sample.Status.TRUNCATED
+        case "abort":
+            sample.status = Sample.Status.ABORTED
+        case "stop":
+            sample.status = Sample.Status.COMPLETED
+
+    sample.debug_dict = results
+    return sample
+
+
+def compute_score(
+    solution_str: str,
+    ground_truth: str,
+    strict_box_verify: bool = False,
+    pause_tokens_index: Optional[list[int]] = None,
+) -> Union[float, Dict[str, Any]]:
+    """Compute the reward score for a solution.
+
+    Args:
+        solution_str: The solution string
+        ground_truth: The ground truth answer
+        config: Configuration object containing reward model settings
+        pause_tokens_index: Indices of pause tokens
+
+    Returns:
+        Reward score (1.0 for correct, -1.0 for incorrect)
+    """
+    # Limit solution length for efficiency
+    # BOB: disable it for now because code execution may need longer context
+    # solution_str = solution_str[-300:]  # The longest answer in MATH-500 has 159 characters
+
+    # Verify the solution
+    ground_truth = int(ground_truth)
+    try:
+        pred = int(remove_boxed(last_boxed_only_string(solution_str)))
+    except Exception as e:
+        pred = None
+    correct = pred == ground_truth
+
+    reward = 1.0 if correct else -1.0
+    # acc = correct
+    result = {
+        "score": reward,  # int
+        "pred": pred,  # int
+        "gt": ground_truth,  # int
+    }
+
+    return result
+
+
+async def reward_func(args, sample, **kwargs):
+    """Tool call reward function using math_dapo as primary reward model"""
+    if not isinstance(sample, Sample):
+        raise TypeError("Sample must be an instance of Sample class.")
+
+    # Build complete solution string
+    solution_str = sample.prompt + sample.response
+
+    # Get ground truth answer - label is a string, not a dict
+    ground_truth = sample.label if sample.label is not None else ""
+    # use \\boxed{...} answer
+    result = compute_score(solution_str, ground_truth, strict_box_verify=True)
+    # logger.info(f"zzzzlog grading {result=}, on {solution_str[-100:]=} against {ground_truth=}")
+
+    debug_dict = sample.debug_dict
+    if debug_dict is not None:
+        debug_dict["score_result"] = result
+        debug_dict["group_index"] = sample.group_index
+
+    # WARNING: needs to check float or dict is the correct format
+    return result

@@ -386,6 +386,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             advantages = list(torch.split(whitened_advs_flat, chunk_lengths))
 
     rollout_data["advantages"] = advantages
+    rollout_data["advantages_abs"] = [adv.abs() for adv in advantages]
     rollout_data["returns"] = returns
 
 
