@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import shutil
 from pathlib import Path
 from typing import IO
@@ -14,7 +15,7 @@ PROMPT_TEMPLATE = (
     "Here is a programming problem and a candidate python solution. Think step by step and verify if the "
     "solution is correct for all valid inputs described by the problem. Do not provide fixes.\n\n"
     "The last line of your response should be of the form \n"
-    "Answer: \\\\boxed{{$Answer}}\n"
+    "Answer: \\boxed{{$Answer}}\n"
     "where $Answer is 1 if the solution is correct and 0 if it is incorrect.\n\n"
     "**Problem**\n"
     "{question}\n\n"
@@ -37,22 +38,10 @@ def parse_args() -> argparse.Namespace:
         help="Directory that contains the new_code files (default: %(default)s)",
     )
     parser.add_argument(
-        "--train-dir",
+        "--output-dir",
         type=Path,
-        default=None,
-        help="Destination directory for the train split files (default: <source>/train)",
-    )
-    parser.add_argument(
-        "--test-dir",
-        type=Path,
-        default=None,
-        help="Destination directory for the test split files (default: <source>/test)",
-    )
-    parser.add_argument(
-        "--validation-dir",
-        type=Path,
-        default=None,
-        help="Destination directory for the validation split files (default: <source>/validation)",
+        default=Path("/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/slime/data/new_code_processed"),
+        help="Destination directory for split files (default: <source>)",
     )
     return parser.parse_args()
 
@@ -142,14 +131,28 @@ def split_file(
     return counts
 
 
+def write_sampled_file(path: Path, sample_size: int = 1600) -> int:
+    with path.open("r", encoding="utf-8") as handle:
+        lines = [line for line in handle if line.strip()]
+    total = len(lines)
+    if total <= sample_size:
+        return total
+
+    rng = random.Random(0)
+    sampled = rng.sample(lines, sample_size)
+    sampled_path = path.with_name(build_split_name(path.name, f"sampled_{sample_size}"))
+    with sampled_path.open("w", encoding="utf-8") as handle:
+        handle.writelines(sampled)
+    return total
+
+
 def main() -> None:
     args = parse_args()
     source_dir = args.source.expanduser().resolve()
-    train_dir = args.train_dir.expanduser().resolve() if args.train_dir else (source_dir / "train").resolve()
-    test_dir = args.test_dir.expanduser().resolve() if args.test_dir else (source_dir / "test").resolve()
-    validation_dir = (
-        args.validation_dir.expanduser().resolve() if args.validation_dir else (source_dir / "validation").resolve()
-    )
+    output_dir = args.output_dir.expanduser().resolve() if args.output_dir else source_dir
+    train_dir = (output_dir / "train").resolve()
+    test_dir = (output_dir / "test").resolve()
+    validation_dir = (output_dir / "validation").resolve()
 
     if not source_dir.is_dir():
         raise FileNotFoundError(f"Source directory '{source_dir}' does not exist.")
@@ -169,6 +172,10 @@ def main() -> None:
         counts = split_file(path, split_targets)
         for split_name, value in counts.items():
             aggregate_counts[split_name] += value
+
+    for test_file in sorted(test_dir.iterdir()) if test_dir.exists() else []:
+        if test_file.is_file():
+            write_sampled_file(test_file, sample_size=1600)
 
     for split_name, (target_dir, _) in split_targets.items():
         print(f"Wrote {aggregate_counts[split_name]} rows into directory {target_dir}")

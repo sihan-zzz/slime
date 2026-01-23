@@ -37,7 +37,7 @@ You are a helpful assistant.
 To use python execution env, return a json object with function name and arguments 
 within <tool_call></tool_call> XML tags:
 <tool_call>
-{"name": code_interpreter, "arguments": {"code": "your python code here", "stdin": "input to the code if any"}}
+{"name": "code_interpreter", "arguments": {"code": "your python code here", "stdin": "input to the code if any"}}
 </tool_call> \n
 This is a standard python env without third-party libraries or internet access. 
 Execution results will be returned within <interpreter></interpreter> XML tags.
@@ -100,7 +100,7 @@ def postprocess_predictions(
 ) -> tuple[Optional[str], Union[str, Dict[str, Any], List[tuple[str, Dict[str, Any]]]]]:
     """Extract actions and content (supports multiple <tool_call> blocks)"""
     # 1. Check for Answer:\boxed{...}
-    answer_pattern = r"Answer:\s*\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
+    answer_pattern = r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
     answer_match = re.search(answer_pattern, prediction, re.DOTALL)
     if answer_match:
         return "answer", answer_match.group(1).strip()
@@ -123,12 +123,17 @@ def postprocess_predictions(
                     stdin_value = arguments.get("stdin", arguments.get("input", None))
                     if code:
                         results.append(("code", {"code": code, "stdin": stdin_value}))
-            except (json.JSONDecodeError, KeyError, AttributeError):
+            except (json.JSONDecodeError, KeyError, AttributeError) as e:
+                logger.error(f"Error {e=} processing tool call: {json_str=}")
                 continue
 
         # If multiple tool calls were found, return all of them
         if results:
             return "multi_code", results
+        else:
+            action = "found matched but no valid tool calls"
+    else:
+        action = "no_tool_calls_found"
         # Otherwise, fall through
 
     # 3. <code>...</code>
@@ -141,7 +146,7 @@ def postprocess_predictions(
     if python_code_match:
         return "code", {"code": python_code_match.group(1).strip(), "stdin": None}
 
-    return None, ""
+    return action, ""
 
 
 def postprocess_responses(resp: str) -> str:
@@ -241,7 +246,7 @@ async def execute_predictions(prediction: str, max_tools_calls_per_turn=4) -> st
         )
         done = False
 
-    return next_obs, done
+    return next_obs, done, action
 
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
@@ -346,10 +351,10 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         if output["meta_info"]["finish_reason"]["type"] == "length":
             break
 
-        next_obs, done = await execute_predictions(
+        next_obs, done, action = await execute_predictions(
             cur_response, max_tools_calls_per_turn=TOOL_CONFIGS["max_tool_calls_per_turn"]
         )
-
+        results[turn]["action"] = action
         if len(next_obs) > 5000:
             next_obs = next_obs[:5000] + "[Truncated]"
         if done:
@@ -357,11 +362,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             results[turn]["done"] = done
             break
         elif turn == TOOL_CONFIGS["max_turns"] - 1:
-            next_obs = f"<|im_start|>tools {next_obs} \n max amount of tool calls reached, think and give your answer. <|im_end|><|im_start|> assistant"
+            next_obs = f"<|im_start|>tools {next_obs} \n max amount of tool calls reached, think and give your answer. <|im_end|><|im_start|> assistant\n"
             results[turn]["ob"] = next_obs
             results[turn]["done"] = done
         else:
-            next_obs = f"<|im_start|>tools {next_obs} \n given above tool call results, think and decide if you need to call any tools or give answer directly. <|im_end|><|im_start|> assistant"
+            next_obs = f"<|im_start|>tools {next_obs} \n given above tool call results, think and decide if you need to call any tools or give answer directly. <|im_end|><|im_start|> assistant\n"
             results[turn]["ob"] = next_obs
             results[turn]["done"] = done
 

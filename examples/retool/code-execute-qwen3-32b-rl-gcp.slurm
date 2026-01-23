@@ -69,7 +69,10 @@ export CPLUS_INCLUDE_PATH="$CUDA_HOME/include:${CPLUS_INCLUDE_PATH:-}"
 # TorchMemorySaver used by sglang currently errors when expandable_segments is on.
 # Leave unset to keep the default allocator unless you know you are not using TorchMemorySaver.
 # export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export TRITON_CACHE_DIR="/tmp/${SLURM_JOB_ID}/${SLURM_PROCID:-0}"
+export TRITON_CACHE_DIR="/tmp/${SLURM_JOB_ID}/${SLURM_PROCID:-0}/triton"
+export XDG_CACHE_HOME="/tmp/${SLURM_JOB_ID}/${SLURM_PROCID:-0}/xdg"
+export TORCHINDUCTOR_CACHE_DIR="/tmp/${SLURM_JOB_ID}/${SLURM_PROCID:-0}/torchinductor"
+export CUDA_CACHE_PATH="/tmp/${SLURM_JOB_ID}/${SLURM_PROCID:-0}/nvrtc_cache"
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export NCCL_IB_DISABLE=0
 export NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-3}
@@ -180,7 +183,7 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 export PYTHONBUFFERED=16
 export MASTER_ADDR
 export MASTER_PORT
-source ${SLIME_REPO_DIR}/scripts/models/qwen3-8B.sh
+source ${SLIME_REPO_DIR}/scripts/models/qwen3-32B.sh
 
 # common runtime env used for ray job submit (tweak PYTHONPATH)
 RUNTIME_ENV_JSON=$(cat <<EOF
@@ -200,9 +203,9 @@ EOF
 MOUNT_DIR="/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/slime"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${MOUNT_DIR}/qwen3_8b
-   --ref-load ${MOUNT_DIR}/qwen3_8b_torch_dist
-   --save ${MOUNT_DIR}/qwen3-8b-rl-multi-turn/${UNIQUE_JOB_NAME}
+   --hf-checkpoint ${MOUNT_DIR}/qwen3_32b
+   --ref-load ${MOUNT_DIR}/qwen3_32b_torch_dist
+   --save ${MOUNT_DIR}/qwen3-32b-rl-multi-turn/${UNIQUE_JOB_NAME}
    --save-interval 20
    --rotary-base 1000000
 )
@@ -222,7 +225,7 @@ ROLLOUT_ARGS=(
    --rollout-batch-size 32
    --n-samples-per-prompt 8
    --rollout-max-response-len 8192
-   --rollout-temperature 0.6
+   --rollout-temperature 0.8
    --rollout-top-p 0.95
    --rollout-top-k 20
    --over-sampling-batch-size 64
@@ -233,7 +236,7 @@ ROLLOUT_ARGS=(
 )
 
 EVAL_ARGS=(
-   # --eval-interval 20
+   --eval-interval 20
    --eval-prompt-data ${EVAL_DATA}
    --n-samples-per-eval-prompt 1
    --eval-max-response-len 8192
@@ -243,7 +246,7 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size 8
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -253,7 +256,7 @@ PERF_ARGS=(
    # --recompute-method uniform
    # --recompute-num-layers 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 65536
+   --max-tokens-per-gpu 32768
 )
 
 GRPO_ARGS=(
@@ -283,7 +286,7 @@ WANDB_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 1
+   --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.9
 )
 
