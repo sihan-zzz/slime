@@ -181,6 +181,8 @@ class Dataset:
         seed=42,
         apply_chat_template=False,
         apply_chat_template_kwargs=None,
+        store_raw_data=False,
+        raw_data_key="_raw_data",
     ):
         origin_samples = []
         for data in read_file(path):
@@ -189,6 +191,10 @@ class Dataset:
             prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
 
             metadata = data.get(metadata_key) or {}
+            if store_raw_data:
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata[raw_data_key] = data
             tools = None
             if tool_key is not None and tool_key in data:
                 tools = data[tool_key]

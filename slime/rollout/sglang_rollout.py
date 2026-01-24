@@ -22,6 +22,7 @@ from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
 from slime.utils.http_utils import get, post
 from slime.utils.misc import SingletonMeta, load_function
+from slime.utils import logging_utils
 from slime.utils.processing_utils import encode_image_for_rollout_engine, load_processor, load_tokenizer
 from slime.utils.types import Sample
 
@@ -267,7 +268,6 @@ async def generate_and_rm_group(
 
     if state.aborted:
         return group
-
     tasks = []
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
@@ -513,7 +513,8 @@ async def eval_rollout_single_dataset(
 
     global EVAL_PROMPT_DATASET
 
-    cache_key = dataset_cfg.cache_key + (args.hf_checkpoint, args.apply_chat_template)
+    store_raw_data = bool(getattr(args, "eval_scan_output_path", None))
+    cache_key = dataset_cfg.cache_key + (args.hf_checkpoint, args.apply_chat_template, store_raw_data)
     if cache_key not in EVAL_PROMPT_DATASET:
         tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
@@ -529,6 +530,7 @@ async def eval_rollout_single_dataset(
             tool_key=dataset_cfg.tool_key,
             apply_chat_template=args.apply_chat_template,
             apply_chat_template_kwargs=args.apply_chat_template_kwargs,
+            store_raw_data=store_raw_data,
         )
     dataset = EVAL_PROMPT_DATASET[cache_key]
 
@@ -544,7 +546,20 @@ async def eval_rollout_single_dataset(
         spaces_between_special_tokens=False,
     )
 
-    tasks = []
+    max_inflight = (
+        args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+        if args.rollout_num_gpus
+        else args.sglang_server_concurrency
+    )
+    max_inflight = max(1, int(max_inflight))
+    pending: set[asyncio.Task] = set()
+    total_tasks = len(dataset.samples) * dataset_cfg.n_samples_per_eval_prompt
+    completed_tasks = 0
+    log_every = max(1, total_tasks // 1000)
+    data = []
+    do_print = True
+    pbar = tqdm(total=total_tasks, desc=f"Eval {dataset_cfg.name}", disable=not do_print)
+
     # do multiple samples for eval prompts
     sample_index = 0
     for _i, prompt_sample in enumerate(dataset.samples):
@@ -552,6 +567,7 @@ async def eval_rollout_single_dataset(
             # use the same prompt for multiple samples
             sample = copy.deepcopy(prompt_sample)
             sample.index = sample_index
+            sample.group_index = _i
             sample_index += 1
             sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
             sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
@@ -559,7 +575,40 @@ async def eval_rollout_single_dataset(
             if getattr(args, "sglang_enable_deterministic_inference", False):
                 sampling_params = base_sampling_params.copy()
                 sampling_params["sampling_seed"] = args.rollout_seed + j
-            tasks.append(
+            while len(pending) >= max_inflight:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    result = task.result()
+                    if isinstance(result, list):
+                        data.extend(result)
+                        completed = len(result)
+                    else:
+                        data.append(result)
+                        completed = 1
+                    if do_print:
+                        sample_preview = result[0] if isinstance(result, list) else result
+                        logger.info(
+                            "eval_rollout_single_dataset example data: "
+                            f"{[str(sample_preview.prompt) + sample_preview.response]} "
+                            f"reward={sample_preview.reward}"
+                        )
+                        do_print = False
+                    completed_tasks += completed
+                    pbar.update(completed)
+                    if args.use_wandb and completed_tasks % log_every == 0:
+                        progress = completed_tasks / total_tasks if total_tasks else 1.0
+                        logging_utils.log(
+                            args,
+                            {
+                                f"eval/{dataset_cfg.name}/progress": progress,
+                                f"eval/{dataset_cfg.name}/completed": completed_tasks,
+                                f"eval/{dataset_cfg.name}/total": total_tasks,
+                                "eval/progress_step": completed_tasks,
+                            },
+                            step_key="eval/progress_step",
+                        )
+
+            pending.add(
                 asyncio.create_task(
                     generate_and_rm(
                         args,
@@ -570,23 +619,38 @@ async def eval_rollout_single_dataset(
                 )
             )
 
-    data = []
-    do_print = True
-    pbar = tqdm(total=len(tasks), desc=f"Eval {dataset_cfg.name}", disable=not do_print)
-    for coro in asyncio.as_completed(tasks):
-        sample = await coro
-        if do_print:
-            logger.info(
-                "eval_rollout_single_dataset example data: "
-                f"{[str(sample.prompt) + sample.response]} "
-                f"reward={sample.reward}"
-            )
-            do_print = False
-        if isinstance(sample, list):
-            data.extend(sample)
-        else:
-            data.append(sample)
-        pbar.update(1)
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            result = task.result()
+            if isinstance(result, list):
+                data.extend(result)
+                completed = len(result)
+            else:
+                data.append(result)
+                completed = 1
+            if do_print:
+                sample_preview = result[0] if isinstance(result, list) else result
+                logger.info(
+                    "eval_rollout_single_dataset example data: "
+                    f"{[str(sample_preview.prompt) + sample_preview.response]} "
+                    f"reward={sample_preview.reward}"
+                )
+                do_print = False
+            completed_tasks += completed
+            pbar.update(completed)
+            if args.use_wandb and (completed_tasks % log_every == 0 or completed_tasks == total_tasks):
+                progress = completed_tasks / total_tasks if total_tasks else 1.0
+                logging_utils.log(
+                    args,
+                    {
+                        f"eval/{dataset_cfg.name}/progress": progress,
+                        f"eval/{dataset_cfg.name}/completed": completed_tasks,
+                        f"eval/{dataset_cfg.name}/total": total_tasks,
+                        "eval/progress_step": completed_tasks,
+                    },
+                    step_key="eval/progress_step",
+                )
     pbar.close()
 
     data.sort(key=lambda sample: sample.index)

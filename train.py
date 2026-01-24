@@ -120,6 +120,23 @@ def add_custom_args(parser):
             "The file will be saved to `save_eval_debug_rollout_data.format(eval_dataset_name, rollout_id)`."
         ),
     )
+    parser.add_argument(
+        "--eval-scan-output-path",
+        type=str,
+        default=None,
+        help="Write eval-scan filtered prompts to this jsonl path when a custom eval log hook is enabled.",
+    )
+    parser.add_argument(
+        "--eval-scan-min-correct",
+        type=int,
+        default=None,
+        help="Keep prompts with correct_count < eval_scan_min_correct when running eval scan.",
+    )
+    parser.add_argument(
+        "--eval-scan-overwrite",
+        action="store_true",
+        help="Overwrite eval-scan output file on rollout_id==0.",
+    )
     return parser
 
 
