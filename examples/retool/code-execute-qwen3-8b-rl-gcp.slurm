@@ -233,7 +233,7 @@ ROLLOUT_ARGS=(
 )
 
 EVAL_ARGS=(
-   # --eval-interval 20
+   --eval-interval 20
    --eval-prompt-data ${EVAL_DATA}
    --n-samples-per-eval-prompt 1
    --eval-max-response-len 8192

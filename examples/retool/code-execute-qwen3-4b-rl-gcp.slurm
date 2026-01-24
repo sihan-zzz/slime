@@ -69,10 +69,7 @@ export CPLUS_INCLUDE_PATH="$CUDA_HOME/include:${CPLUS_INCLUDE_PATH:-}"
 # TorchMemorySaver used by sglang currently errors when expandable_segments is on.
 # Leave unset to keep the default allocator unless you know you are not using TorchMemorySaver.
 # export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export TRITON_CACHE_DIR="/tmp/${SLURM_JOB_ID}/${SLURM_PROCID:-0}/triton"
-export XDG_CACHE_HOME="/tmp/${SLURM_JOB_ID}/${SLURM_PROCID:-0}/xdg"
-export TORCHINDUCTOR_CACHE_DIR="/tmp/${SLURM_JOB_ID}/${SLURM_PROCID:-0}/torchinductor"
-export CUDA_CACHE_PATH="/tmp/${SLURM_JOB_ID}/${SLURM_PROCID:-0}/nvrtc_cache"
+export TRITON_CACHE_DIR="/tmp/${SLURM_JOB_ID}/${SLURM_PROCID:-0}"
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export NCCL_IB_DISABLE=0
 export NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-3}
@@ -183,41 +180,31 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 export PYTHONBUFFERED=16
 export MASTER_ADDR
 export MASTER_PORT
-source ${SLIME_REPO_DIR}/scripts/models/qwen3-32B.sh
-
-ADD_ARGS=${ADD_ARGS:-""}
+source ${SLIME_REPO_DIR}/scripts/models/qwen3-4B-Instruct-2507.sh 
 
 # common runtime env used for ray job submit (tweak PYTHONPATH)
-# export CUDA_DEVICE_MAX_CONNECTIONS=1
-# export NCCL_NVLS_ENABLE=${HAS_NVLINK}
-# export NCCL_SHARP_DISABLE=1
-# export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
-# export TORCH_COMPILE_DISABLE=1
+RUNTIME_ENV_JSON=$(cat <<EOF
+{
+  "env_vars": {
+    "PYTHONPATH": "${PYTHONPATH_VALUE}",
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "NCCL_NVLS_ENABLE": "${HAS_NVLINK}",
+    "NCCL_SHARP_DISABLE": "1",
+    "NCCL_DEBUG": "WARN",
+    "TORCH_COMPILE_DISABLE": "1"
+  }
+}
+EOF
+)
 
-# check if TRUE_ON_POLICY is true, if yes then setting above 3 and append --true-on-policy-mode to ADD_ARGS
-if [ "${TRUE_ON_POLICY:-false}" = "true" ]; then
-      export NCCL_ALGO=Ring
-      export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
-      export CUBLAS_WORKSPACE_CONFIG=":4096:8"
-      # Increase FlashInfer workspace to avoid aligned_alloc overflow in prefill.
-      export SGLANG_FLASHINFER_WORKSPACE_SIZE=$((8 * 1024 * 1024 * 1024))
-      ADD_ARGS+=" --true-on-policy-mode"
-      ADD_ARGS+=" --sglang-enable-deterministic-inference"
-      ADD_ARGS+=" --sglang-rl-on-policy-target fsdp"
-      ADD_ARGS+=" --sglang-attention-backend flashinfer"
-      ADD_ARGS+=" --deterministic-mode"
-      # --sglang-mem-fraction-static 0.9
-      ADD_ARGS+=" --sglang-mem-fraction-static 0.7"
-fi
-export ADD_ARGS
 MOUNT_DIR="/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/slime"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${MOUNT_DIR}/qwen3_32b
-   --ref-load ${MOUNT_DIR}/qwen3_32b_torch_dist
-   --save ${MOUNT_DIR}/qwen3-32b-rl-multi-turn/${UNIQUE_JOB_NAME}
+   --hf-checkpoint ${MOUNT_DIR}/qwen3_4b_instruct
+   --ref-load ${MOUNT_DIR}/qwen3_4b_instruct_torch_dist
+   --save ${MOUNT_DIR}/qwen3-4b-rl-multi-turn/${UNIQUE_JOB_NAME}
    --save-interval 20
-   --rotary-base 1000000
+   --rotary-base 5000000
 )
 
 export NUM_ROLLOUT=${NUM_ROLLOUT:-500}
@@ -235,7 +222,7 @@ ROLLOUT_ARGS=(
    --rollout-batch-size 32
    --n-samples-per-prompt 8
    --rollout-max-response-len 8192
-   --rollout-temperature 0.8
+   --rollout-temperature 0.6
    --rollout-top-p 0.95
    --rollout-top-k 20
    --over-sampling-batch-size 64
@@ -256,7 +243,7 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 8
+   --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -266,7 +253,7 @@ PERF_ARGS=(
    # --recompute-method uniform
    # --recompute-num-layers 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 32768
+   --max-tokens-per-gpu 65536
 )
 
 GRPO_ARGS=(
@@ -296,7 +283,7 @@ WANDB_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 2
+   --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.9
 )
 
@@ -345,6 +332,7 @@ TRAIN_CMD+=("${CUSTOM_ARGS[@]}")
 TRAIN_CMD_STR=$(printf '%q ' "${TRAIN_CMD[@]}")
 TRAIN_CMD_STR=${TRAIN_CMD_STR% }
 
+export ADD_ARGS=${ADD_ARGS:-""}
 echo "Launching training directly on the head node (this will BLOCK the sbatch until finished)"
 echo "Model args: ${MODEL_ARGS[*]}"
 export PYTHONPATH="${PYTHONPATH_VALUE}"

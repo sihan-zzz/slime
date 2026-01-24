@@ -426,6 +426,19 @@ async def generate_rollout_async(
         f"zzzzlog rollout_id={rollout_id} getting {len(data)} batches, each batch of {len(data[0])} responses, "
         f"{positive_batch=} positive, {negative_batch=} negative"
     )
+
+    response_action_counts: dict[str, int] = {}
+    for group in data:
+        for sample in group:
+            if hasattr(sample, "response_actions"):
+                for action, count in sample.response_actions.items():
+                    response_action_counts[f"rollout/response_action_ratio/{action}"] = (
+                        response_action_counts.get(f"rollout/response_action_ratio/{action}", 0) + count
+                    )
+    # normalize by total samples
+    total_samples = len(data) * args.n_samples_per_prompt
+    for action in response_action_counts:
+        response_action_counts[action] /= total_samples
     adhoc_metric_dict = {
         "rollout/dynamic_filter/remain_positive_ratio": (
             positive_batch / (positive_batch + negative_batch) if (positive_batch + negative_batch) > 0 else 0.0
@@ -435,6 +448,7 @@ async def generate_rollout_async(
         "rollout/avg_turns": sum(sample.turn_finished for group in data for sample in group)
         / (len(data) * args.n_samples_per_prompt),
         "rollout/avg_reward_before_filter": sum(scores) / len(scores),
+        **response_action_counts,
     }
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)

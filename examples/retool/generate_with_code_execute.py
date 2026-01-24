@@ -108,7 +108,7 @@ def postprocess_predictions(
     # 2. Check for one or more <tool_call> blocks
     tool_call_pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
     tool_call_matches = re.findall(tool_call_pattern, prediction, re.DOTALL)
-
+    parsing_error = None
     if tool_call_matches:
         results = []
         for json_str in tool_call_matches:
@@ -125,15 +125,16 @@ def postprocess_predictions(
                         results.append(("code", {"code": code, "stdin": stdin_value}))
             except (json.JSONDecodeError, KeyError, AttributeError) as e:
                 logger.error(f"Error {e=} processing tool call: {json_str=}")
+                parsing_error = f"{e} when parsing the tool_call"
                 continue
 
         # If multiple tool calls were found, return all of them
         if results:
             return "multi_code", results
         else:
-            action = "found matched but no valid tool calls"
+            return "invalid_tool_calls", parsing_error
     else:
-        action = "no_tool_calls_found"
+        action = "no_tool_calls_nor_answer"
         # Otherwise, fall through
 
     # 3. <code>...</code>
@@ -236,6 +237,18 @@ async def execute_predictions(prediction: str, max_tools_calls_per_turn=4) -> st
     elif action == "answer":
         next_obs = ""
         done = True
+    elif action == "invalid_tool_calls":
+        next_obs = content
+        done = False
+    elif action == "no_tool_calls":
+        next_obs = (
+            "\nYour previous action did not contain any valid tool calls or final answer. "
+            "If You want to execute code, you should put the code between "
+            "<tool_call> and </tool_call>. "
+            "If You want to give the final answer, you should use the format "
+            "'Answer: \\boxed{answer}'. Try again.\n"
+        )
+        done = False
     else:
         next_obs = (
             "\nYour previous action is invalid. "
@@ -267,6 +280,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     response_token_ids = []
     response_logprob = []
     loss_masks = []
+    response_actions = {}
     tool_call_count = 0  # Track actual tool call rounds
     output = None
     results = {"prompt": prompt, "index": sample.index}
@@ -354,6 +368,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         next_obs, done, action = await execute_predictions(
             cur_response, max_tools_calls_per_turn=TOOL_CONFIGS["max_tool_calls_per_turn"]
         )
+        response_actions[action] = response_actions.get(action, 0) + 1
         results[turn]["action"] = action
         if len(next_obs) > 5000:
             next_obs = next_obs[:5000] + "[Truncated]"
@@ -392,6 +407,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.response_length = len(response_token_ids)
     sample.response = response
     sample.loss_masks = loss_masks
+    sample.response_actions = response_actions
 
     # Store payload information for wandb logging
     sample.payload_text = prompt + response
