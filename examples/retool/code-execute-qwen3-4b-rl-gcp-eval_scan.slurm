@@ -211,6 +211,9 @@ export NUM_ROLLOUT=${NUM_ROLLOUT:-0}
 export TRAIN_DATA=${TRAIN_DATA:-${MOUNT_DIR}/data/APPS-dataset/APPS-synthetic-train.jsonl}
 export EVAL_DATA=${EVAL_DATA:-"2_all ${MOUNT_DIR}/data/new_code_processed/test/2_python_all_test.jsonl"}
 export EVAL_SCAN_OUTPUT=${EVAL_SCAN_OUTPUT:-${MOUNT_DIR}/data/new_code_processed/test/2_python_filter_by_qwen3_4b.jsonl}
+# suffix the EVAL_SCAN_OUTPUT by job id to avoid overwriting from multiple runs
+export EVAL_SCAN_OUTPUT="${EVAL_SCAN_OUTPUT%.*}_${UNIQUE_JOB_NAME}.jsonl"
+
 ROLLOUT_ARGS=(
    --prompt-data $TRAIN_DATA
    --input-key prompt

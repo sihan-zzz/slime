@@ -43,6 +43,7 @@ def _extract_raw_sample(samples: list[Sample]) -> dict[str, Any] | None:
             return metadata[_RAW_DATA_KEY]
     return None
 
+from time import sleep
 
 def log_eval_rollout_data(rollout_id, args, data, extra_metrics=None) -> bool:
     output_path = getattr(args, "eval_scan_output_path", None)
@@ -84,6 +85,8 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics=None) -> bool:
                         "prompt": group_samples[0].prompt,
                         "label": group_samples[0].label,
                         "metadata": getattr(group_samples[0], "metadata", None),
+                        "correct_count": correct_count,
+                        "total_count": len(group_samples),
                     }
                 if raw_sample is not None:
                     selected.append(raw_sample)
@@ -160,5 +163,5 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics=None) -> bool:
     step = compute_rollout_step(args, rollout_id)
     log_dict["eval/step"] = step
     logging_utils.log(args, log_dict, step_key="eval/step")
-
+    sleep(30)
     return True
