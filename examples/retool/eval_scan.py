@@ -3,6 +3,8 @@ import logging
 import os
 from typing import Any
 
+from slime.utils import logging_utils
+from slime.utils.metric_utils import compute_rollout_step
 from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -56,6 +58,8 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics=None) -> bool:
 
     selected = []
     total_groups = 0
+    selected_counts: dict[str, int] = {}
+    group_counts: dict[str, int] = {}
     for dataset_name, payload in data.items():
         samples = payload.get("samples") or []
         groups: dict[int, list[Sample]] = {}
@@ -68,6 +72,8 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics=None) -> bool:
                     group_idx = len(groups)
             groups.setdefault(group_idx, []).append(sample)
 
+        group_counts[dataset_name] = len(groups)
+        selected_counts[dataset_name] = 0
         for group_idx, group_samples in groups.items():
             total_groups += 1
             correct_count = sum(_is_correct(sample, reward_key) for sample in group_samples)
@@ -81,13 +87,54 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics=None) -> bool:
                     }
                 if raw_sample is not None:
                     selected.append(raw_sample)
+                    selected_counts[dataset_name] += 1
         logger.info(
             "eval_scan dataset=%s groups=%d selected=%d min_correct=%d",
             dataset_name,
             len(groups),
-            len(selected),
+            selected_counts[dataset_name],
             min_correct,
         )
+
+    log_dict = extra_metrics or {}
+    for dataset_name, payload in data.items():
+        selected_count = selected_counts.get(dataset_name, 0)
+        group_count = group_counts.get(dataset_name, 0)
+        not_selected = max(group_count - selected_count, 0)
+        selected_ratio = (selected_count / group_count) if group_count else 0.0
+        log_dict[f"eval_scan/{dataset_name}/selected"] = selected_count
+        log_dict[f"eval_scan/{dataset_name}/not_selected"] = not_selected
+        log_dict[f"eval_scan/{dataset_name}/total"] = group_count
+        log_dict[f"eval_scan/{dataset_name}/selected_ratio"] = selected_ratio
+
+        if "accuracy" in payload:
+            log_dict[f"eval/{dataset_name}-acc"] = payload["accuracy"]
+        if "precision" in payload:
+            log_dict[f"eval/{dataset_name}-precision"] = payload["precision"]
+        if "recall" in payload:
+            log_dict[f"eval/{dataset_name}-recall"] = payload["recall"]
+        if "tnr" in payload:
+            log_dict[f"eval/{dataset_name}-tnr"] = payload["tnr"]
+        if "f1" in payload:
+            log_dict[f"eval/{dataset_name}-f1"] = payload["f1"]
+        if "average_response_length" in payload:
+            log_dict[f"eval/{dataset_name}-average_response_length"] = payload["average_response_length"]
+        if "average_tool_call_count" in payload:
+            log_dict[f"eval/{dataset_name}-average_tool_call_count"] = payload["average_tool_call_count"]
+        if "average_turn_finished" in payload:
+            log_dict[f"eval/{dataset_name}-average_turn_finished"] = payload["average_turn_finished"]
+        if "truncated" in payload:
+            truncated = payload["truncated"]
+            log_dict[f"eval/{dataset_name}-truncated_ratio"] = (
+                sum(truncated) / len(truncated) if truncated else 0.0
+            )
+
+    total_selected = len(selected)
+    total_not_selected = max(total_groups - total_selected, 0)
+    log_dict["eval_scan/selected"] = total_selected
+    log_dict["eval_scan/not_selected"] = total_not_selected
+    log_dict["eval_scan/total"] = total_groups
+    log_dict["eval_scan/selected_ratio"] = (total_selected / total_groups) if total_groups else 0.0
 
     if not selected:
         logger.info("eval_scan: no prompts selected for output.")
@@ -109,5 +156,9 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics=None) -> bool:
             rollout_id,
             bool(getattr(args, "eval_scan_overwrite", False)),
         )
+
+    step = compute_rollout_step(args, rollout_id)
+    log_dict["eval/step"] = step
+    logging_utils.log(args, log_dict, step_key="eval/step")
 
     return True

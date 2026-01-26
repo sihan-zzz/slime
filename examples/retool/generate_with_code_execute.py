@@ -25,7 +25,7 @@ except ImportError:
 from tool_sandbox import SEMAPHORE, TOOL_CONFIGS, tool_registry
 
 # Jinja2 template for tool-enabled conversations
-TOOL_TEMPLATE = """<|im_start|>system\n
+TOOL_TEMPLATE = """<|im_start|>system\n\n
 {%- if messages[0]['role'] == 'system' %}
 {{- messages[0]['content'] }}
 {%- else %}
@@ -38,7 +38,7 @@ To use python execution env, return a json object with function name and argumen
 within <tool_call></tool_call> XML tags:
 <tool_call>
 {"name": "code_interpreter", "arguments": {"code": "your python code here", "stdin": "input to the code if any"}}
-</tool_call> \n
+</tool_call>
 This is a standard python env without third-party libraries or internet access. 
 Execution results will be returned within <interpreter></interpreter> XML tags.
 
@@ -70,13 +70,10 @@ def format_conversation_with_tools(
     else:
         system_content = (
             # "You are a program solution verifier that can verify whether a program is a correct solution to a coding problem. "
-            " You are a program solution verifier that can use Python "
-            "tools to verify whether a program is a correct solution to a coding problem. "
-            "Instructions: "
-            "1. Use the code_interpreter tool when necessary to run any code needed for verification"
-            "2. Think about edge case test inputs that can help verify the correctness of the solution."
-            "3. If the code uses libraries that are not available in the code interpreter, "
-            "just reason about the code without executing it."
+            "You are a generic verifier that can use Python "
+            "tools to verify whether a solution is correct to a given math/coding question. "
+            "When you need to perform calculations or execute code against test inputs, use the code_interpreter tool."
+            "Don't fix the solution if it is wrong, just verify and give the final answer."
         )
 
     messages_to_render.append({"role": "system", "content": system_content})

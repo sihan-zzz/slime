@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-#SBATCH --job-name=team_mle
+#SBATCH --job-name=team_mle_eval_scan
 #SBATCH --exclusive
 #SBATCH --ntasks-per-node=1            # one launcher per node (procid 0..N-1)
 #SBATCH --gpus-per-node=8              # GPUs per node
@@ -21,9 +21,7 @@ set -ex
 # --- user tweakables ---
 GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-8}}  # fallback if your cluster exposes env var differently
 export GPUS_PER_NODE
-export TRAIN_NODES=${TRAIN_NODES:-2}
-export ROLLOUT_NODES=$(($SLURM_NNODES - TRAIN_NODES))
-echo "Training using ${TRAIN_NODES} nodes, rollout using ${ROLLOUT_NODES} nodes."
+echo "Colocate training+rollout on ${SLURM_NNODES} nodes."
 PYTHON=python
 WORKSPACE_DIR="/home/sihanzeng_meta_com/uv"
 
@@ -198,6 +196,7 @@ EOF
 )
 
 MOUNT_DIR="/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/slime"
+TOTAL_GPUS=$((GPUS_PER_NODE * SLURM_NNODES))
 
 CKPT_ARGS=(
    --hf-checkpoint ${MOUNT_DIR}/qwen3_8b
@@ -207,10 +206,11 @@ CKPT_ARGS=(
    --rotary-base 1000000
 )
 
-export NUM_ROLLOUT=${NUM_ROLLOUT:-500}
+export NUM_ROLLOUT=${NUM_ROLLOUT:-0}
 
 export TRAIN_DATA=${TRAIN_DATA:-${MOUNT_DIR}/data/APPS-dataset/APPS-synthetic-train.jsonl}
-export EVAL_DATA=${EVAL_DATA:-${MOUNT_DIR}/data/APPS-dataset/APPS-synthetic-test.jsonl}
+export EVAL_DATA=${EVAL_DATA:-"2_all ${MOUNT_DIR}/data/new_code_processed/test/2_python_all_test.jsonl"}
+export EVAL_SCAN_OUTPUT=${EVAL_SCAN_OUTPUT:-${MOUNT_DIR}/data/new_code_processed/test/2_python_filter_by_qwen3_8b_${UNIQUE_JOB_NAME}.jsonl}
 ROLLOUT_ARGS=(
    --prompt-data $TRAIN_DATA
    --input-key prompt
@@ -221,7 +221,7 @@ ROLLOUT_ARGS=(
    --num-rollout ${NUM_ROLLOUT}
    --rollout-batch-size 32
    --n-samples-per-prompt 8
-   --rollout-max-response-len 16384
+   --rollout-max-response-len 8192
    --rollout-temperature 0.6
    --rollout-top-p 0.95
    --rollout-top-k 20
@@ -229,18 +229,14 @@ ROLLOUT_ARGS=(
    --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
    --global-batch-size 256
    --balance-data
-   --rollout-num-gpus $((8 * $ROLLOUT_NODES))
-   # --rollout-temperature 1.0 
-   # --rollout-temperature-anneal-style cosine 
-   # --rollout-temperature-anneal-end 0.6 
-   # --rollout-temperature-anneal-steps 200
+   --rollout-num-gpus ${TOTAL_GPUS}
 )
 
 EVAL_ARGS=(
-   --eval-interval 20
+   --eval-interval 1
    --eval-prompt-data ${EVAL_DATA}
-   --n-samples-per-eval-prompt 1
-   --eval-max-response-len 16384
+   --n-samples-per-eval-prompt 8
+   --eval-max-response-len 8192
    --eval-temperature 0.6
    --eval-top-p 0.95
    --eval-top-k 20
@@ -311,13 +307,30 @@ CUSTOM_ARGS=(
    --rollout-health-check-timeout 45
 )
 
+EVAL_SCAN_ARGS=(
+   --custom-eval-rollout-log-function-path eval_scan.log_eval_rollout_data
+   --eval-scan-output-path ${EVAL_SCAN_OUTPUT}
+   --eval-scan-min-correct 7
+   --eval-scan-overwrite
+)
+
+# Avoid zero-step LR scheduler assertions when NUM_ROLLOUT=0.
+EVAL_ONLY_ARGS=(
+   --lr-decay-iters 1
+   --lr-warmup-iters 0
+)
+
+COLOCATE_ARGS=(
+   --colocate
+)
+
 TARGET="${MOUNT_DIR}/${SLURM_JOB_ID}/"
 rm -r -f ${TARGET}
 mkdir ${TARGET}
 TRAIN_CMD=(
    ${PYTHON}
    train.py
-   --actor-num-nodes ${TRAIN_NODES}
+   --actor-num-nodes ${SLURM_NNODES}
    --actor-num-gpus-per-node ${GPUS_PER_NODE}
    --output_sample_file "${TARGET}"
    --dump-details "${TARGET}/dump_details/"
@@ -333,6 +346,9 @@ TRAIN_CMD+=("${EVAL_ARGS[@]}")
 TRAIN_CMD+=("${SGLANG_ARGS[@]}")
 TRAIN_CMD+=("${MISC_ARGS[@]}")
 TRAIN_CMD+=("${CUSTOM_ARGS[@]}")
+TRAIN_CMD+=("${EVAL_SCAN_ARGS[@]}")
+TRAIN_CMD+=("${EVAL_ONLY_ARGS[@]}")
+TRAIN_CMD+=("${COLOCATE_ARGS[@]}")
 TRAIN_CMD_STR=$(printf '%q ' "${TRAIN_CMD[@]}")
 TRAIN_CMD_STR=${TRAIN_CMD_STR% }
 

@@ -21,9 +21,7 @@ set -ex
 # --- user tweakables ---
 GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-8}}  # fallback if your cluster exposes env var differently
 export GPUS_PER_NODE
-export TRAIN_NODES=${TRAIN_NODES:-2}
-export ROLLOUT_NODES=$(($SLURM_NNODES - TRAIN_NODES))
-echo "Training using ${TRAIN_NODES} nodes, rollout using ${ROLLOUT_NODES} nodes."
+echo "Colocate training+rollout on ${SLURM_NNODES} nodes."
 PYTHON=python
 WORKSPACE_DIR="/home/sihanzeng_meta_com/uv"
 
@@ -198,6 +196,7 @@ EOF
 )
 
 MOUNT_DIR="/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/slime"
+TOTAL_GPUS=$((GPUS_PER_NODE * SLURM_NNODES))
 
 CKPT_ARGS=(
    --hf-checkpoint ${MOUNT_DIR}/qwen3_4b_instruct
@@ -230,7 +229,7 @@ ROLLOUT_ARGS=(
    --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
    --global-batch-size 256
    --balance-data
-   --rollout-num-gpus $((8 * $ROLLOUT_NODES))
+   --rollout-num-gpus ${TOTAL_GPUS}
 )
 
 EVAL_ARGS=(
@@ -307,6 +306,9 @@ CUSTOM_ARGS=(
    --custom-rm-path generate_with_code_execute.reward_func
    --rollout-health-check-timeout 45
 )
+COLOCATE_ARGS=(
+   --colocate
+)
 
 EVAL_SCAN_ARGS=(
    --custom-eval-rollout-log-function-path eval_scan.log_eval_rollout_data
@@ -327,7 +329,7 @@ mkdir ${TARGET}
 TRAIN_CMD=(
    ${PYTHON}
    train.py
-   --actor-num-nodes ${TRAIN_NODES}
+   --actor-num-nodes ${SLURM_NNODES}
    --actor-num-gpus-per-node ${GPUS_PER_NODE}
    --output_sample_file "${TARGET}"
    --dump-details "${TARGET}/dump_details/"
@@ -345,6 +347,7 @@ TRAIN_CMD+=("${MISC_ARGS[@]}")
 TRAIN_CMD+=("${CUSTOM_ARGS[@]}")
 TRAIN_CMD+=("${EVAL_SCAN_ARGS[@]}")
 TRAIN_CMD+=("${EVAL_ONLY_ARGS[@]}")
+TRAIN_CMD+=("${COLOCATE_ARGS[@]}")
 TRAIN_CMD_STR=$(printf '%q ' "${TRAIN_CMD[@]}")
 TRAIN_CMD_STR=${TRAIN_CMD_STR% }
 

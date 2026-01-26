@@ -13,7 +13,7 @@ from typing import IO
 
 PROMPT_TEMPLATE = (
     "Here is a programming problem and a candidate python solution. Think step by step and verify if the "
-    "solution is correct for all valid inputs described by the problem. Do not provide fixes.\n\n"
+    "solution is correct not only for inputs described by the problem but also other edge cases that you can think of.\n\n"
     "The last line of your response should be of the form \n"
     "Answer: \\boxed{{$Answer}}\n"
     "where $Answer is 1 if the solution is correct and 0 if it is incorrect.\n\n"

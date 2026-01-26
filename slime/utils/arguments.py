@@ -222,6 +222,31 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="the temperature for the inference engine during rollout.",
             )
             parser.add_argument(
+                "--rollout-temperature-anneal-style",
+                type=str,
+                default=None,
+                choices=["linear", "cosine", "exponential"],
+                help="Anneal rollout temperature across rollouts using the given style.",
+            )
+            parser.add_argument(
+                "--rollout-temperature-anneal-start",
+                type=float,
+                default=None,
+                help="Starting temperature for rollout annealing. Defaults to --rollout-temperature.",
+            )
+            parser.add_argument(
+                "--rollout-temperature-anneal-end",
+                type=float,
+                default=None,
+                help="Final temperature for rollout annealing.",
+            )
+            parser.add_argument(
+                "--rollout-temperature-anneal-steps",
+                type=int,
+                default=None,
+                help="Number of rollouts to anneal from start to end (clamped afterward).",
+            )
+            parser.add_argument(
                 "--rollout-top-p", type=float, default=1.0, help="the top-p for the inference engine during rollout."
             )
             parser.add_argument(

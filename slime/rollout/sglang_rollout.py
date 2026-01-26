@@ -3,6 +3,7 @@ import copy
 import inspect
 import logging
 import json
+import math
 import os
 from argparse import Namespace
 from collections.abc import Callable
@@ -31,6 +32,59 @@ from .rm_hub import async_rm, batched_async_rm
 __all__ = ["generate_rollout"]
 
 logger = logging.getLogger(__name__)
+
+
+def _compute_rollout_temperature(args: Namespace, rollout_id: int) -> float:
+    style = getattr(args, "rollout_temperature_anneal_style", None)
+    end = getattr(args, "rollout_temperature_anneal_end", None)
+    steps = getattr(args, "rollout_temperature_anneal_steps", None)
+    if style is None or end is None or steps is None:
+        if any(v is not None for v in (style, end, steps)):
+            warned_key = "_warned_incomplete_anneal_args"
+            if not getattr(_compute_rollout_temperature, warned_key, False):
+                logger.warning(
+                    "Temperature annealing is partially configured (style/end/steps). "
+                    "Ignoring annealing and using --rollout-temperature."
+                )
+                setattr(_compute_rollout_temperature, warned_key, True)
+        return args.rollout_temperature
+
+    start = getattr(args, "rollout_temperature_anneal_start", None)
+    if start is None:
+        start = args.rollout_temperature
+
+    if steps <= 0:
+        return end
+
+    ratio = min(max(rollout_id, 0), steps) / float(steps)
+    if style == "linear":
+        temp = start + (end - start) * ratio
+    elif style == "cosine":
+        coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
+        temp = end + (start - end) * coeff
+    elif style == "exponential":
+        if start <= 0 or end <= 0:
+            warned_key = "_warned_exponential_invalid"
+            if not getattr(_compute_rollout_temperature, warned_key, False):
+                logger.warning(
+                    "Exponential annealing requires positive start/end temperatures; "
+                    "falling back to linear annealing."
+                )
+                setattr(_compute_rollout_temperature, warned_key, True)
+            temp = start + (end - start) * ratio
+        else:
+            temp = start * ((end / start) ** ratio)
+    else:
+        temp = args.rollout_temperature
+
+    if temp < 0:
+        warned_key = "_warned_negative_temperature"
+        if not getattr(_compute_rollout_temperature, warned_key, False):
+            logger.warning("Computed rollout temperature is negative; clamping to 0.")
+            setattr(_compute_rollout_temperature, warned_key, True)
+        temp = 0.0
+
+    return temp
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -347,6 +401,8 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
+    current_temperature = _compute_rollout_temperature(args, rollout_id)
+    state.sampling_params["temperature"] = current_temperature
 
     # instantiate data filters
     dynamic_filter = (
@@ -440,6 +496,7 @@ async def generate_rollout_async(
     for action in response_action_counts:
         response_action_counts[action] /= total_samples
     adhoc_metric_dict = {
+        "rollout/temperature": current_temperature,
         "rollout/dynamic_filter/remain_positive_ratio": (
             positive_batch / (positive_batch + negative_batch) if (positive_batch + negative_batch) > 0 else 0.0
         ),
@@ -595,7 +652,7 @@ async def eval_rollout_single_dataset(
                         do_print = False
                     completed_tasks += completed
                     pbar.update(completed)
-                    if args.use_wandb and completed_tasks % log_every == 0:
+                    if args.eval_scan_output_path and args.use_wandb and completed_tasks % log_every == 0:
                         progress = completed_tasks / total_tasks if total_tasks else 1.0
                         logging_utils.log(
                             args,
@@ -684,6 +741,7 @@ async def eval_rollout_single_dataset(
     )
 
     accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
+    accuracy_all = (tp + tn) / len(data) if len(data) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     tnr = tn / (tn + fp) if (tn + fp) > 0 else 0.0
@@ -698,6 +756,7 @@ async def eval_rollout_single_dataset(
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
             "accuracy": accuracy,
+            "accuracy_all": accuracy_all,
             "recall": recall,
             "precision": precision,
             "tnr": tnr,

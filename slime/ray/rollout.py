@@ -685,6 +685,7 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
         log_dict[f"eval/{key}-acc"] = data[key]["accuracy"]
+        log_dict[f"eval/{key}-acc_all"] = data[key]["accuracy_all"]
         log_dict[f"eval/{key}-precision"] = data[key]["precision"]
         log_dict[f"eval/{key}-recall"] = data[key]["recall"]
         log_dict[f"eval/{key}-tnr"] = data[key]["tnr"]
