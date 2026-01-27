@@ -129,12 +129,18 @@ def postprocess_predictions(
                 logger.error(f"Error {e=} processing tool call: {json_str=}, {prediction=}")
                 parsing_error = f"{e} when parsing the tool_call"
                 continue
+            except Exception as e:
+                logger.error(f"Unexpected error {e=} processing tool call: {json_str=}, {prediction=}")
+                parsing_error = f"Unexpected error {e} when parsing the tool_call"
+                continue
 
         # If multiple tool calls were found, return all of them
         if results:
             return "multi_code", results
-        else:
+        elif parsing_error is not None:
             return "invalid_tool_calls", parsing_error
+        else:
+            return "no_tool_calls", "Empty code in tool calls"
     else:
         action = "no_tool_calls_nor_answer"
         # Otherwise, fall through
@@ -366,10 +372,14 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         # Check length limit
         if output["meta_info"]["finish_reason"]["type"] == "length":
             break
-
         next_obs, done, action = await execute_predictions(
             cur_response, max_tools_calls_per_turn=TOOL_CONFIGS["max_tool_calls_per_turn"]
         )
+        if next_obs is None:
+            next_obs = ""
+            logger.info(
+                f"zzzzlog Got None next_obs, {cur_response=}, turn {turn} action: {action}, next_obs: {next_obs}, done: {done}"
+            )
         response_actions[action] = response_actions.get(action, 0) + 1
         results[turn]["action"] = action
         if len(next_obs) > 5000:

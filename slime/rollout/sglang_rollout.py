@@ -717,6 +717,137 @@ async def eval_rollout_single_dataset(
     do_print = True
     pbar = tqdm(total=total_tasks, desc=f"Eval {dataset_cfg.name}", disable=not do_print)
 
+    eval_scan_enabled = bool(args.eval_scan_output_path and args.use_wandb)
+    eval_scan_min_correct = getattr(args, "eval_scan_min_correct", None)
+    eval_scan_reward_key = getattr(args, "eval_reward_key", None) or getattr(args, "reward_key", None)
+    eval_scan_group_size = dataset_cfg.n_samples_per_eval_prompt or 1
+    eval_scan_group_count = len(dataset.samples)
+    eval_scan_selected_count = 0
+    eval_scan_handled_groups: set[int] = set()
+    eval_scan_pending_groups: set[int] = set()
+    eval_scan_group_stats: dict[int, dict[str, Any]] = {}
+    eval_scan_initialized = False
+    eval_scan_output_path = getattr(args, "eval_scan_output_path", None)
+    eval_scan_raw_data_key = "_raw_data"
+
+    if eval_scan_enabled and eval_scan_min_correct is None:
+        raise ValueError("--eval-scan-min-correct must be set when using eval scan output.")
+
+    if eval_scan_enabled and eval_scan_output_path:
+        output_dir = os.path.dirname(eval_scan_output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+    def _eval_scan_get_reward_value(sample: Sample, reward_key: str | None) -> Any:
+        reward = sample.reward
+        if isinstance(reward, dict):
+            if reward_key and reward_key in reward:
+                return reward[reward_key]
+            if "score" in reward:
+                return reward["score"]
+            if "pred" in reward and "gt" in reward:
+                return reward["pred"] == reward["gt"]
+            return None
+        return reward
+
+    def _eval_scan_is_correct(sample: Sample, reward_key: str | None) -> bool:
+        if sample.status in {Sample.Status.TRUNCATED, Sample.Status.ABORTED, Sample.Status.FAILED}:
+            return False
+        value = _eval_scan_get_reward_value(sample, reward_key)
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        return value > 0
+
+    def _eval_scan_extract_raw_sample(sample: Sample) -> dict[str, Any] | None:
+        metadata = getattr(sample, "metadata", None)
+        if isinstance(metadata, dict) and eval_scan_raw_data_key in metadata:
+            raw = metadata[eval_scan_raw_data_key]
+            if isinstance(raw, dict):
+                return raw
+        return None
+
+    def _eval_scan_get_group_idx(sample: Sample) -> int:
+        group_idx = getattr(sample, "group_index", None)
+        if group_idx is not None:
+            return int(group_idx)
+        if sample.index is not None:
+            return int(sample.index // eval_scan_group_size)
+        # Fallback: treat each sample as its own group.
+        return int(len(eval_scan_group_stats))
+
+    def _eval_scan_update_group_stats(sample: Sample) -> None:
+        if not eval_scan_enabled:
+            return
+        group_idx = _eval_scan_get_group_idx(sample)
+        stats = eval_scan_group_stats.setdefault(
+            group_idx,
+            {
+                "completed_count": 0,
+                "correct_count": 0,
+                "total_count": eval_scan_group_size,
+                "raw_sample": None,
+                "sample": sample,
+            },
+        )
+        stats["completed_count"] += 1
+        if _eval_scan_is_correct(sample, eval_scan_reward_key):
+            stats["correct_count"] += 1
+        raw_sample = _eval_scan_extract_raw_sample(sample)
+        if raw_sample is not None and stats["raw_sample"] is None:
+            stats["raw_sample"] = raw_sample
+        if stats["completed_count"] >= stats["total_count"]:
+            eval_scan_pending_groups.add(group_idx)
+
+    def _eval_scan_flush_pending(force: bool = False) -> None:
+        nonlocal eval_scan_initialized, eval_scan_selected_count
+        if not eval_scan_enabled or not eval_scan_output_path:
+            return
+        if not force and not eval_scan_pending_groups:
+            return
+
+        selected: list[dict[str, Any]] = []
+        to_handle = list(eval_scan_pending_groups)
+        for group_idx in to_handle:
+            stats = eval_scan_group_stats.get(group_idx)
+            if stats is None:
+                eval_scan_pending_groups.discard(group_idx)
+                continue
+            if stats["completed_count"] < stats["total_count"] and not force:
+                continue
+
+            eval_scan_pending_groups.discard(group_idx)
+            eval_scan_handled_groups.add(group_idx)
+
+            correct_count = int(stats["correct_count"])
+            if correct_count >= int(eval_scan_min_correct):
+                continue
+
+            raw_sample = stats["raw_sample"]
+            if raw_sample is None:
+                sample = stats["sample"]
+                raw_sample = {
+                    "prompt": sample.prompt,
+                    "label": sample.label,
+                    "metadata": getattr(sample, "metadata", None),
+                }
+            if isinstance(raw_sample, dict):
+                raw_sample = dict(raw_sample)
+                raw_sample["correct_count"] = correct_count
+                raw_sample["total_count"] = int(stats["total_count"])
+                selected.append(raw_sample)
+
+        if selected:
+            mode = "a"
+            if not eval_scan_initialized and rollout_id == 0 and getattr(args, "eval_scan_overwrite", False):
+                mode = "w"
+            with open(eval_scan_output_path, mode) as f:
+                for item in selected:
+                    f.write(json.dumps(item, ensure_ascii=True) + "\n")
+            eval_scan_initialized = True
+            eval_scan_selected_count += len(selected)
+
     # do multiple samples for eval prompts
     sample_index = 0
     for _i, prompt_sample in enumerate(dataset.samples):
@@ -739,9 +870,12 @@ async def eval_rollout_single_dataset(
                     if isinstance(result, list):
                         data.extend(result)
                         completed = len(result)
+                        for sample in result:
+                            _eval_scan_update_group_stats(sample)
                     else:
                         data.append(result)
                         completed = 1
+                        _eval_scan_update_group_stats(result)
                     if do_print:
                         sample_preview = result[0] if isinstance(result, list) else result
                         logger.info(
@@ -753,16 +887,26 @@ async def eval_rollout_single_dataset(
                     completed_tasks += completed
                     pbar.update(completed)
                     if args.eval_scan_output_path and args.use_wandb and completed_tasks % log_every == 0:
+                        _eval_scan_flush_pending(force=False)
                         progress = completed_tasks / total_tasks if total_tasks else 1.0
+                        handled_groups = len(eval_scan_handled_groups)
+                        selected_so_far = eval_scan_selected_count
+                        not_selected_so_far = max(handled_groups - selected_so_far, 0)
+                        selected_ratio_so_far = (selected_so_far / handled_groups) if handled_groups else 0.0
                         logging_utils.log(
                             args,
                             {
-                                f"eval_scan/{dataset_cfg.name}/progress": progress,
-                                f"eval_scan/{dataset_cfg.name}/completed": completed_tasks,
-                                f"eval_scan/{dataset_cfg.name}/total": total_tasks,
-                                "eval_scan/progress_step": completed_tasks,
+                                f"eval_scan_{dataset_cfg.name}/progress": progress,
+                                f"eval_scan_{dataset_cfg.name}/completed": completed_tasks,
+                                f"eval_scan_{dataset_cfg.name}/total": total_tasks,
+                                f"eval_scan_{dataset_cfg.name}/selected": selected_so_far,
+                                f"eval_scan_{dataset_cfg.name}/not_selected": not_selected_so_far,
+                                f"eval_scan_{dataset_cfg.name}/selected_ratio": selected_ratio_so_far,
+                                f"eval_scan_{dataset_cfg.name}/groups_handled": handled_groups,
+                                f"eval_scan_{dataset_cfg.name}/groups_total": eval_scan_group_count,
+                                f"eval_scan_{dataset_cfg.name}/progress_step": completed_tasks,
                             },
-                            step_key="eval_scan/progress_step",
+                            step_key=f"eval_scan_{dataset_cfg.name}/progress_step",
                         )
 
             pending.add(
@@ -783,9 +927,12 @@ async def eval_rollout_single_dataset(
             if isinstance(result, list):
                 data.extend(result)
                 completed = len(result)
+                for sample in result:
+                    _eval_scan_update_group_stats(sample)
             else:
                 data.append(result)
                 completed = 1
+                _eval_scan_update_group_stats(result)
             if do_print:
                 sample_preview = result[0] if isinstance(result, list) else result
                 logger.info(
@@ -796,18 +943,7 @@ async def eval_rollout_single_dataset(
                 do_print = False
             completed_tasks += completed
             pbar.update(completed)
-            if args.use_wandb and (completed_tasks % log_every == 0 or completed_tasks == total_tasks):
-                progress = completed_tasks / total_tasks if total_tasks else 1.0
-                logging_utils.log(
-                    args,
-                    {
-                        f"eval/{dataset_cfg.name}/progress": progress,
-                        f"eval/{dataset_cfg.name}/completed": completed_tasks,
-                        f"eval/{dataset_cfg.name}/total": total_tasks,
-                        "eval/progress_step": completed_tasks,
-                    },
-                    step_key="eval/progress_step",
-                )
+            _eval_scan_flush_pending(force=(completed_tasks == total_tasks))
     pbar.close()
 
     data.sort(key=lambda sample: sample.index)

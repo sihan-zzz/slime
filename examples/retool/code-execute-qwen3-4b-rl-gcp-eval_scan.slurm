@@ -314,7 +314,6 @@ COLOCATE_ARGS=(
 )
 
 EVAL_SCAN_ARGS=(
-   --custom-eval-rollout-log-function-path eval_scan.log_eval_rollout_data
    --eval-scan-output-path ${EVAL_SCAN_OUTPUT}
    --eval-scan-min-correct 7
    --eval-scan-overwrite

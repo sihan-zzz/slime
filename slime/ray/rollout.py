@@ -681,22 +681,22 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
     log_dict = extra_metrics or {}
     for key in data.keys():
         rewards = data[key]["rewards"]
-        log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
+        log_dict[f"eval_{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
-            log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
-        log_dict[f"eval/{key}-acc"] = data[key]["accuracy"]
-        log_dict[f"eval/{key}-acc_all"] = data[key]["accuracy_all"]
-        log_dict[f"eval/{key}-precision"] = data[key]["precision"]
-        log_dict[f"eval/{key}-recall"] = data[key]["recall"]
-        log_dict[f"eval/{key}-tnr"] = data[key]["tnr"]
-        log_dict[f"eval/{key}-f1"] = data[key]["f1"]
-        log_dict[f"eval/{key}-average_response_length"] = data[key]["average_response_length"]
-        log_dict[f"eval/{key}-average_tool_call_count"] = data[key]["average_tool_call_count"]
-        log_dict[f"eval/{key}-average_turn_finished"] = data[key]["average_turn_finished"]
+            log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval_{key}/")
+        log_dict[f"eval_{key}/acc"] = data[key]["accuracy"]
+        log_dict[f"eval_{key}/acc_all"] = data[key]["accuracy_all"]
+        log_dict[f"eval_{key}/precision"] = data[key]["precision"]
+        log_dict[f"eval_{key}/recall"] = data[key]["recall"]
+        log_dict[f"eval_{key}/tnr"] = data[key]["tnr"]
+        log_dict[f"eval_{key}/f1"] = data[key]["f1"]
+        log_dict[f"eval_{key}/average_response_length"] = data[key]["average_response_length"]
+        log_dict[f"eval_{key}/average_tool_call_count"] = data[key]["average_tool_call_count"]
+        log_dict[f"eval_{key}/average_turn_finished"] = data[key]["average_turn_finished"]
 
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
-            log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
+            log_dict[f"eval_{key}/truncated_ratio"] = sum(truncated) / len(truncated)
         if args.log_passrate:
             log_dict |= dict_add_prefix(
                 compute_pass_rate(
