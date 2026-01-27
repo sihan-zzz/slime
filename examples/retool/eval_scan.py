@@ -111,24 +111,24 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics=None) -> bool:
         log_dict[f"eval_scan/{dataset_name}/selected_ratio"] = selected_ratio
 
         if "accuracy" in payload:
-            log_dict[f"eval/{dataset_name}-acc"] = payload["accuracy"]
+            log_dict[f"eval_scan/{dataset_name}-acc"] = payload["accuracy"]
         if "precision" in payload:
-            log_dict[f"eval/{dataset_name}-precision"] = payload["precision"]
+            log_dict[f"eval_scan/{dataset_name}-precision"] = payload["precision"]
         if "recall" in payload:
-            log_dict[f"eval/{dataset_name}-recall"] = payload["recall"]
+            log_dict[f"eval_scan/{dataset_name}-recall"] = payload["recall"]
         if "tnr" in payload:
-            log_dict[f"eval/{dataset_name}-tnr"] = payload["tnr"]
+            log_dict[f"eval_scan/{dataset_name}-tnr"] = payload["tnr"]
         if "f1" in payload:
-            log_dict[f"eval/{dataset_name}-f1"] = payload["f1"]
+            log_dict[f"eval_scan/{dataset_name}-f1"] = payload["f1"]
         if "average_response_length" in payload:
-            log_dict[f"eval/{dataset_name}-average_response_length"] = payload["average_response_length"]
+            log_dict[f"eval_scan/{dataset_name}-average_response_length"] = payload["average_response_length"]
         if "average_tool_call_count" in payload:
-            log_dict[f"eval/{dataset_name}-average_tool_call_count"] = payload["average_tool_call_count"]
+            log_dict[f"eval_scan/{dataset_name}-average_tool_call_count"] = payload["average_tool_call_count"]
         if "average_turn_finished" in payload:
-            log_dict[f"eval/{dataset_name}-average_turn_finished"] = payload["average_turn_finished"]
+            log_dict[f"eval_scan/{dataset_name}-average_turn_finished"] = payload["average_turn_finished"]
         if "truncated" in payload:
             truncated = payload["truncated"]
-            log_dict[f"eval/{dataset_name}-truncated_ratio"] = (
+            log_dict[f"eval_scan/{dataset_name}-truncated_ratio"] = (
                 sum(truncated) / len(truncated) if truncated else 0.0
             )
 
@@ -161,7 +161,7 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics=None) -> bool:
         )
 
     step = compute_rollout_step(args, rollout_id)
-    log_dict["eval/step"] = step
-    logging_utils.log(args, log_dict, step_key="eval/step")
+    log_dict["eval_scan/step"] = step
+    logging_utils.log(args, log_dict, step_key="eval_scan/step")
     sleep(30)
     return True

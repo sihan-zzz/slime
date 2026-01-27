@@ -537,6 +537,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "the input should be the same structure as an openai message, e.g. [{'role': 'user', 'content': 'blabla'}]. "
                 ),
             )
+            parser.add_argument(
+                "--rollout-prompt-data",
+                type=str,
+                default=None,
+                nargs="+",
+                help=(
+                    "Name/path pairs for rollout prompt datasets. "
+                    "If set, overrides --prompt-data for rollout. "
+                    "Example: --rollout-prompt-data code /path/code.jsonl math /path/math.jsonl"
+                ),
+            )
             parser.add_argument("--apply-chat-template", action="store_true", default=False)
             # Temporarily be JSON-serialized str, will be a real dict after using Omegaconf
             parser.add_argument("--apply-chat-template-kwargs", type=json.loads, default="{}")
@@ -582,6 +593,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--n-samples-per-prompt", type=int, default=1, help="Number of responses for each prompt in generation"
+            )
+            parser.add_argument(
+                "--rollout-samples-per-dataset",
+                type=int,
+                default=None,
+                help=(
+                    "Number of prompt groups to collect per dataset in each rollout step. "
+                    "Requires --rollout-prompt-data and an even value to keep pos/neg balanced. "
+                    "rollout_batch_size must equal rollout_samples_per_dataset * num_datasets."
+                ),
             )
 
             # gbs of the training, note that the gbs is of sample, not of prompts,
@@ -1523,8 +1544,30 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
     return eval_datasets
 
 
+def _resolve_rollout_datasets(args) -> list[dict[str, Any]]:
+    """
+    Build rollout dataset configurations from --rollout-prompt-data.
+    """
+    datasets = []
+    if args.rollout_prompt_data:
+        values = list(args.rollout_prompt_data)
+        if len(values) == 1:
+            logger.info(
+                "[legacy] only one rollout_prompt_data detected, will assume it is a single rollout dataset named `rollout`"
+            )
+            values = ["rollout", values[0]]
+        if len(values) % 2 != 0:
+            raise ValueError("rollout prompt data must be provided as name/path pairs.")
+        datasets = [{"name": values[i], "path": values[i + 1]} for i in range(0, len(values), 2)]
+
+        if args.prompt_data is not None:
+            logger.info("--rollout-prompt-data is set; --prompt-data will be ignored for rollout.")
+    return datasets
+
+
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
+    args.rollout_datasets = _resolve_rollout_datasets(args)
 
     if args.kl_coef != 0 or args.use_kl_loss:
         if not os.path.exists(args.ref_load):
@@ -1562,6 +1605,17 @@ def slime_validate_args(args):
         assert args.save is not None, "'--save' is required when save_interval is set."
 
     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
+
+    if args.rollout_samples_per_dataset is not None:
+        assert args.rollout_datasets, "--rollout-samples-per-dataset requires --rollout-prompt-data"
+        assert args.rollout_samples_per_dataset % 2 == 0, (
+            "--rollout-samples-per-dataset must be even to keep pos/neg balanced per dataset"
+        )
+        expected_batch_size = args.rollout_samples_per_dataset * len(args.rollout_datasets)
+        assert args.rollout_batch_size == expected_batch_size, (
+            f"rollout_batch_size {args.rollout_batch_size} must equal "
+            f"rollout_samples_per_dataset {args.rollout_samples_per_dataset} * num_datasets {len(args.rollout_datasets)}"
+        )
 
     if args.advantage_estimator in ["reinforce_plus_plus", "reinforce_plus_plus_baseline"]:
         assert args.normalize_advantages, (

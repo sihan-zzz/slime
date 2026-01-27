@@ -6,7 +6,6 @@ import json
 import math
 import os
 from argparse import Namespace
-from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
@@ -384,7 +383,7 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
 
 
 async def generate_rollout_async(
-    args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]
+    args: Namespace, rollout_id: int, data_source: Any
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     """An example to implement the generate_rollout function for an rule based rm rollout generation.
 
@@ -413,11 +412,19 @@ async def generate_rollout_async(
 
     # target_data_size is the total number of valid samples to get
     target_data_size = args.rollout_batch_size
-    target_split_data_size = target_data_size / 2
+    num_datasets = getattr(data_source, "num_datasets", 1)
+    per_dataset_target = None
+    if args.rollout_samples_per_dataset is not None:
+        per_dataset_target = args.rollout_samples_per_dataset
+        target_split_data_size = per_dataset_target // 2
+        pos_data = [[] for _ in range(num_datasets)]
+        neg_data = [[] for _ in range(num_datasets)]
+    else:
+        target_split_data_size = target_data_size / 2
+        pos_data = []
+        neg_data = []
 
     all_data = []
-    pos_data = []
-    neg_data = []
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
 
@@ -425,11 +432,56 @@ async def generate_rollout_async(
         f"zzzzlog Starting rollout: {args.rollout_batch_size=}, {args.n_samples_per_prompt=}, {(target_data_size * args.n_samples_per_prompt)=}",
     )
     scores = []
-    while len(pos_data) + len(neg_data) < target_data_size:
-        while state.remaining_batch_size < target_data_size:
+
+    def _total_collected() -> int:
+        if per_dataset_target is None:
+            return len(pos_data) + len(neg_data)
+        return sum(len(pos_data[i]) + len(neg_data[i]) for i in range(num_datasets))
+
+    def _remaining_per_dataset() -> list[int]:
+        remaining = [
+            per_dataset_target - (len(pos_data[i]) + len(neg_data[i])) for i in range(num_datasets)
+        ]
+        logging.info("Remaining per dataset: " + ", ".join(f"{i}: {remaining[i]}" for i in range(num_datasets)))
+        return remaining
+
+    def _allocate_dataset_counts(remaining: list[int], max_total: int) -> dict[int, int]:
+        if max_total <= 0:
+            return {}
+        counts = [0] * len(remaining)
+        allocated = 0
+        dataset_idx = 0
+        while allocated < max_total and any(remaining[i] > counts[i] for i in range(len(remaining))):
+            if remaining[dataset_idx] > counts[dataset_idx]:
+                counts[dataset_idx] += 1
+                allocated += 1
+            dataset_idx = (dataset_idx + 1) % len(remaining)
+        return {idx: count for idx, count in enumerate(counts) if count > 0}
+
+    def _get_group_dataset_idx(group: list[Sample]) -> int:
+        if not group:
+            return 0
+        sample = group[0][0] if isinstance(group[0], list) else group[0]
+        metadata = getattr(sample, "metadata", {}) or {}
+        return int(metadata.get("rollout_dataset_idx", 0))
+
+    while _total_collected() < target_data_size:
+        newly_add_samples = 0
+
+        # sending over-sampling requests to keep gpu busy
+        while state.remaining_batch_size < args.over_sampling_batch_size:
             # get samples from the buffer and submit the generation requests.
-            samples = data_source(args.over_sampling_batch_size)
+            if per_dataset_target is None:
+                samples = data_source.get_samples(args.over_sampling_batch_size)
+            else:
+                remaining = _remaining_per_dataset()
+                if sum(remaining) == 0:
+                    break
+                dataset_counts = _allocate_dataset_counts(remaining, args.over_sampling_batch_size)
+                samples = data_source.get_samples(sum(dataset_counts.values()), dataset_counts=dataset_counts)
             state.submit_generate_tasks(samples)
+            newly_add_samples += 1
+        logging.info(f"Submitted {newly_add_samples} new sample batches, total pending: {len(state.pendings)}")
 
         # wait for the generation to finish
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
@@ -457,31 +509,67 @@ async def generate_rollout_async(
 
             # keep positive and negative balancedly
             group_label = group[0].label
-            if group_label > 0.5:
-                if len(pos_data) < target_split_data_size:
-                    pos_data.append(group)
-                    pbar.update(args.n_samples_per_prompt)
+            if per_dataset_target is None:
+                if group_label > 0.5:
+                    if len(pos_data) < target_split_data_size:
+                        pos_data.append(group)
+                        pbar.update(args.n_samples_per_prompt)
+                    else:
+                        state.remaining_batch_size -= 1
                 else:
-                    state.remaining_batch_size -= 1
+                    if len(neg_data) < target_split_data_size:
+                        neg_data.append(group)
+                        pbar.update(args.n_samples_per_prompt)
+                    else:
+                        state.remaining_batch_size -= 1
             else:
-                if len(neg_data) < target_split_data_size:
-                    neg_data.append(group)
-                    pbar.update(args.n_samples_per_prompt)
+                dataset_idx = _get_group_dataset_idx(group)
+                if dataset_idx >= num_datasets:
+                    dataset_idx = 0
+                if group_label > 0.5:
+                    if len(pos_data[dataset_idx]) < target_split_data_size:
+                        pos_data[dataset_idx].append(group)
+                        pbar.update(args.n_samples_per_prompt)
+                    else:
+                        state.remaining_batch_size -= 1
                 else:
-                    state.remaining_batch_size -= 1
+                    if len(neg_data[dataset_idx]) < target_split_data_size:
+                        neg_data[dataset_idx].append(group)
+                        pbar.update(args.n_samples_per_prompt)
+                    else:
+                        state.remaining_batch_size -= 1
 
     pbar.close()
-    data = pos_data + neg_data
+    if per_dataset_target is None:
+        data = pos_data + neg_data
+    else:
+        data = []
+        for dataset_idx in range(num_datasets):
+            data.extend(pos_data[dataset_idx])
+            data.extend(neg_data[dataset_idx])
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(
         f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
     )
     positive_batch = sum(group[0].label > 0.5 for group in data)
     negative_batch = sum(group[0].label < 0.5 for group in data)
-    logger.info(
-        f"zzzzlog rollout_id={rollout_id} getting {len(data)} batches, each batch of {len(data[0])} responses, "
-        f"{positive_batch=} positive, {negative_batch=} negative"
-    )
+    if per_dataset_target is None:
+        logger.info(
+            f"zzzzlog rollout_id={rollout_id} getting {len(data)} batches, each batch of {len(data[0])} responses, "
+            f"{positive_batch=} positive, {negative_batch=} negative"
+        )
+    else:
+        dataset_names = getattr(data_source, "dataset_names", None)
+        dataset_logs = []
+        for dataset_idx in range(num_datasets):
+            name = dataset_names[dataset_idx] if dataset_names else str(dataset_idx)
+            dataset_logs.append(
+                f"{name}: pos={len(pos_data[dataset_idx])}, neg={len(neg_data[dataset_idx])}"
+            )
+        logger.info(
+            f"zzzzlog rollout_id={rollout_id} getting {len(data)} batches, each batch of {len(data[0])} responses, "
+            f"{positive_batch=} positive, {negative_batch=} negative, per_dataset=({'; '.join(dataset_logs)})"
+        )
 
     response_action_counts: dict[str, int] = {}
     for group in data:
@@ -507,6 +595,18 @@ async def generate_rollout_async(
         "rollout/avg_reward_before_filter": sum(scores) / len(scores),
         **response_action_counts,
     }
+    if per_dataset_target is not None:
+        dataset_names = getattr(data_source, "dataset_names", None)
+        for dataset_idx in range(num_datasets):
+            name = dataset_names[dataset_idx] if dataset_names else str(dataset_idx)
+            pos_ct = len(pos_data[dataset_idx])
+            neg_ct = len(neg_data[dataset_idx])
+            total_ct = pos_ct + neg_ct
+            adhoc_metric_dict[f"rollout_per_dataset/{name}/positive"] = pos_ct
+            adhoc_metric_dict[f"rollout_per_dataset/{name}/negative"] = neg_ct
+            adhoc_metric_dict[f"rollout_per_dataset/{name}/positive_ratio"] = (
+                pos_ct / total_ct if total_ct > 0 else 0.0
+            )
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)
 
@@ -657,12 +757,12 @@ async def eval_rollout_single_dataset(
                         logging_utils.log(
                             args,
                             {
-                                f"eval/{dataset_cfg.name}/progress": progress,
-                                f"eval/{dataset_cfg.name}/completed": completed_tasks,
-                                f"eval/{dataset_cfg.name}/total": total_tasks,
-                                "eval/progress_step": completed_tasks,
+                                f"eval_scan/{dataset_cfg.name}/progress": progress,
+                                f"eval_scan/{dataset_cfg.name}/completed": completed_tasks,
+                                f"eval_scan/{dataset_cfg.name}/total": total_tasks,
+                                "eval_scan/progress_step": completed_tasks,
                             },
-                            step_key="eval/progress_step",
+                            step_key="eval_scan/progress_step",
                         )
 
             pending.add(
@@ -788,6 +888,6 @@ def generate_rollout(
         output, _ = run(eval_rollout(args, rollout_id))
         return output
 
-    output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_source.get_samples))
+    output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_source))
     data_source.add_samples(aborted_samples)
     return output

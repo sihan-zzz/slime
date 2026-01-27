@@ -210,9 +210,11 @@ CKPT_ARGS=(
 export NUM_ROLLOUT=${NUM_ROLLOUT:-500}
 
 export TRAIN_DATA=${TRAIN_DATA:-${MOUNT_DIR}/data/APPS-dataset/APPS-synthetic-train.jsonl}
+export MATH_DATA=${MATH_DATA:-${MOUNT_DIR}/data/math/5_mathematical_processed_data_prompt.jsonl}
 export EVAL_DATA=${EVAL_DATA:-${MOUNT_DIR}/data/APPS-dataset/APPS-synthetic-test.jsonl}
 ROLLOUT_ARGS=(
-   --prompt-data $TRAIN_DATA
+   --rollout-prompt-data code $TRAIN_DATA math $MATH_DATA
+   --rollout-samples-per-dataset 16
    --input-key prompt
    --label-key label
    --apply-chat-template

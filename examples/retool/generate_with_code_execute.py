@@ -37,9 +37,14 @@ You are a helpful assistant.
 To use python execution env, return a json object with function name and arguments 
 within <tool_call></tool_call> XML tags:
 <tool_call>
-{"name": "code_interpreter", "arguments": {"code": "your python code here", "stdin": "input to the code if any"}}
+{"name":"code_interpreter","arguments":{"code":"print(1+1)","stdin":""}}
 </tool_call>
 This is a standard python env without third-party libraries or internet access. 
+When generating tool calls:
+- The "code" field MUST contain raw python code only.
+- DO NOT use markdown fences (```).
+- DO NOT add backticks.
+- Only plain python text.
 Execution results will be returned within <interpreter></interpreter> XML tags.
 
 {%- endif %}
@@ -121,7 +126,7 @@ def postprocess_predictions(
                     if code:
                         results.append(("code", {"code": code, "stdin": stdin_value}))
             except (json.JSONDecodeError, KeyError, AttributeError) as e:
-                logger.error(f"Error {e=} processing tool call: {json_str=}")
+                logger.error(f"Error {e=} processing tool call: {json_str=}, {prediction=}")
                 parsing_error = f"{e} when parsing the tool_call"
                 continue
 
