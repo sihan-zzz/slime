@@ -239,7 +239,7 @@ ROLLOUT_ARGS=(
 )
 
 EVAL_ARGS=(
-   --eval-interval 20
+   # --eval-interval 20
    --eval-prompt-data ${EVAL_DATA}
    --n-samples-per-eval-prompt 1
    --eval-max-response-len 16384
@@ -293,7 +293,6 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 4
    --sglang-mem-fraction-static 0.9
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
-   --sglang-allow-auto-truncate
 )
 
 MISC_ARGS=(
@@ -326,6 +325,7 @@ TRAIN_CMD=(
    --actor-num-gpus-per-node ${GPUS_PER_NODE}
    --output_sample_file "${TARGET}"
    --dump-details "${TARGET}/dump_details/"
+   --load-debug-rollout-data "/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/slime/6120/dump_details/rollout_data/{rollout_id}.pt"
 )
 TRAIN_CMD+=("${MODEL_ARGS[@]}")
 TRAIN_CMD+=("${CKPT_ARGS[@]}")

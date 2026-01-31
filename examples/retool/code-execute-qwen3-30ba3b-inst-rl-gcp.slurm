@@ -200,11 +200,11 @@ EOF
 MOUNT_DIR="/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/slime"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${MOUNT_DIR}/qwen3_30b_a3b
-   --ref-load ${MOUNT_DIR}/qwen3_30b_a3b_torch_dist
+   --hf-checkpoint ${MOUNT_DIR}/qwen3_30b_a3b_instruct
+   --ref-load ${MOUNT_DIR}/qwen3_30b_a3b_instruct_torch_dist
    --save ${MOUNT_DIR}/qwen3-30b-rl-multi-turn/${UNIQUE_JOB_NAME}
    --save-interval 20
-   --rotary-base 1000000
+   --rotary-base 10000000
 )
 
 export NUM_ROLLOUT=${NUM_ROLLOUT:-500}
@@ -251,16 +251,16 @@ EVAL_ARGS=(
 PERF_ARGS=(
    --tensor-model-parallel-size 4
    --sequence-parallel
-   --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --pipeline-model-parallel-size 2
+   --context-parallel-size 2
    --expert-model-parallel-size 8
    --expert-tensor-parallel-size 1
-   --recompute-granularity full
-   --recompute-method uniform
-   --recompute-num-layers 1
+   # --recompute-granularity full
+   # --recompute-method uniform
+   # --recompute-num-layers 1
 
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 128000
+   --max-tokens-per-gpu 32768
 )
 
 GRPO_ARGS=(
@@ -293,7 +293,6 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 4
    --sglang-mem-fraction-static 0.9
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
-   --sglang-allow-auto-truncate
 )
 
 MISC_ARGS=(

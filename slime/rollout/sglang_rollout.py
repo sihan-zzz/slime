@@ -583,6 +583,13 @@ async def generate_rollout_async(
     total_samples = len(data) * args.n_samples_per_prompt
     for action in response_action_counts:
         response_action_counts[action] /= total_samples
+    dataset_epoch_metrics: dict[str, int] = {}
+    dataset_epoch_ids = getattr(data_source, "dataset_epoch_ids", None)
+    dataset_names = getattr(data_source, "dataset_names", None)
+    if dataset_epoch_ids is not None and dataset_names:
+        for dataset_idx, epoch_id in enumerate(dataset_epoch_ids):
+            name = dataset_names[dataset_idx] if dataset_idx < len(dataset_names) else str(dataset_idx)
+            dataset_epoch_metrics[f"rollout/{name}_eopch_id"] = int(epoch_id)
     adhoc_metric_dict = {
         "rollout/temperature": current_temperature,
         "rollout/dynamic_filter/remain_positive_ratio": (
@@ -594,19 +601,8 @@ async def generate_rollout_async(
         / (len(data) * args.n_samples_per_prompt),
         "rollout/avg_reward_before_filter": sum(scores) / len(scores),
         **response_action_counts,
+        **dataset_epoch_metrics,
     }
-    if per_dataset_target is not None:
-        dataset_names = getattr(data_source, "dataset_names", None)
-        for dataset_idx in range(num_datasets):
-            name = dataset_names[dataset_idx] if dataset_names else str(dataset_idx)
-            pos_ct = len(pos_data[dataset_idx])
-            neg_ct = len(neg_data[dataset_idx])
-            total_ct = pos_ct + neg_ct
-            adhoc_metric_dict[f"rollout_per_dataset/{name}/positive"] = pos_ct
-            adhoc_metric_dict[f"rollout_per_dataset/{name}/negative"] = neg_ct
-            adhoc_metric_dict[f"rollout_per_dataset/{name}/positive_ratio"] = (
-                pos_ct / total_ct if total_ct > 0 else 0.0
-            )
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)
 
@@ -983,9 +979,14 @@ async def eval_rollout_single_dataset(
     tnr = tn / (tn + fp) if (tn + fp) > 0 else 0.0
     f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
     num_none = sum(1 for sample in data if sample.reward["pred"] is None)
+    truncated = sum(1 for sample in data if sample.status == Sample.Status.TRUNCATED)
     average_response_length = sum(sample.response_length for sample in data if not sample.status == Sample.Status.TRUNCATED) / len(data)
     average_tool_call_count = sum(sample.tool_call_count for sample in data if not sample.status == Sample.Status.TRUNCATED) / len(data)
     average_turn_finished = sum(sample.turn_finished for sample in data if not sample.status == Sample.Status.TRUNCATED) / len(data)
+    logger.info(
+        f"Eval {rollout_id=}, {tp=}, {tn=}, {fp=}, {fn=}, {accuracy=}, {accuracy_all=}, {recall=}, {precision=}"
+        f"{tnr=}, {f1=}, {num_none=}, {truncated=}"
+    )
     return {
         dataset_cfg.name: {
             "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],

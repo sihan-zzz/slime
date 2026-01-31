@@ -19,6 +19,17 @@ MATH_PROMPT_TEMPLATE = (
     "{answer}"
 )
 
+NEW_MATH_PROMPT_TEMPLATE = """
+    Your task is to analyze a mathematical solution step-by-step and determine if it is correct.
+    Input:
+    - Problem: "{prompt}"
+    - Model Solution: "{answer}"
+    Output:
+    1. First, provide a detailed step-by-step analysis of the model solution. For each step, explain what is being done and why.
+    2. After the analysis, conclude with a final verdict in the form: \n Answer: \\boxed{{$Answer}} \n
+       where $Answer is 1 if the solution is correct and 0 if it is incorrect.
+    """
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
