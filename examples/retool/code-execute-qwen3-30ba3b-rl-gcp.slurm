@@ -276,7 +276,7 @@ GRPO_ARGS=(
 OPTIMIZER_ARGS=(
    --optimizer adam
    --lr 1e-6
-   --lr-decay-style cosine
+   --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98

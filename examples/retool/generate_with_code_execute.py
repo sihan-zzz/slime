@@ -75,7 +75,7 @@ def format_conversation_with_tools(
     else:
         system_content = (
             # "You are a program solution verifier that can verify whether a program is a correct solution to a coding problem. "
-            "You are a generic verifier that can use Python "
+            " You are a generic verifier that can use Python "
             "tools to verify whether a solution is correct to a given math/coding question. "
             "When you need to perform calculations or execute code against test inputs, use the code_interpreter tool."
             "Don't fix the solution if it is wrong, just verify and give the final answer."
@@ -145,84 +145,14 @@ def postprocess_predictions(
         action = "no_tool_calls_nor_answer"
         # Otherwise, fall through
 
-    # 3. <code>...</code>
-    code_match = re.search(r"<code>(.*?)</code>", prediction, re.DOTALL)
-    if code_match:
-        return "code", {"code": code_match.group(1).strip(), "stdin": None}
-
-    # 4. ```python ... ```
-    python_code_match = re.search(r"```python\s*(.*?)\s*```", prediction, re.DOTALL)
-    if python_code_match:
-        return "code", {"code": python_code_match.group(1).strip(), "stdin": None}
-
     return action, ""
-
-
-def postprocess_responses(resp: str) -> str:
-    """Post-process response to ensure tag completeness"""
-
-    # # BOB: in qwen3-8b and above, the model generates thinkings and needs to get rid of it
-    # marker="</think>"
-    # if marker in resp:
-    #     resp = resp.split(marker)[-1]
-
-    # Handle <tool_call> tags (new format from Jinja2 template)
-    if "<tool_call>" in resp:
-        # Find the last occurrence of <tool_call>...</tool_call>
-        tool_call_pattern = r"<tool_call>\s*\{.*?\}\s*</tool_call>"
-        matches = list(re.finditer(tool_call_pattern, resp, re.DOTALL))
-        if matches:
-            last_match = matches[-1]
-            return resp[: last_match.end()]
-
-    # Handle <code> tags
-    if "</code>" in resp:
-        return resp.split("</code>")[0] + "</code>"
-
-    # Handle ```python code blocks
-    if "```python" in resp:
-        # Find the last occurrence of ```python...```
-        python_pattern = r"```python\s*.*?```"
-        matches = list(re.finditer(python_pattern, resp, re.DOTALL))
-        if matches:
-            last_match = matches[-1]
-            return resp[: last_match.end()]
-
-    # Handle Answer: \boxed{...} format (only format we need for math_dapo)
-    if "Answer:" in resp and "\\boxed{" in resp:
-        # Find the last occurrence of Answer: \boxed{...} with nested braces support
-        answer_pattern = r"Answer:\s*\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
-        matches = list(re.finditer(answer_pattern, resp, re.DOTALL))
-        if matches:
-            last_match = matches[-1]
-            return resp[: last_match.end()]
-
-    return resp
 
 
 async def execute_predictions(prediction: str, max_tools_calls_per_turn=4) -> str:
     """Execute predictions and return results"""
     action, content = postprocess_predictions(prediction)
 
-    if action == "code":
-        # Content is already the Python code (extracted by
-        # postprocess_predictions)
-        code = content["code"].strip() if isinstance(content, dict) else str(content).strip()
-        stdin_value = content.get("stdin") if isinstance(content, dict) else None
-        if code:
-            # TODO BOB: this will create a deadlock!!!
-            async with SEMAPHORE:
-                args = {"code": code}
-                if stdin_value is not None:
-                    args["stdin"] = stdin_value
-                result = await tool_registry.execute_tool("code_interpreter", args)
-
-            next_obs = f"\n\n<interpreter>\n{result}\n</interpreter>\n\n"
-            done = False
-        else:
-            next_obs = "\n\n<interpreter>\nError: No Python code found" "\n</interpreter>\n\n"
-            done = False
-    elif action == "multi_code":
+    if action == "multi_code":
         # only execute up to max_tools_calls_per_turn
         results = []
         for i, (act, cont) in enumerate(content):
@@ -292,6 +222,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     tool_call_count = 0  # Track actual tool call rounds
     output = None
     results = {"prompt": prompt, "index": sample.index}
+    valid_tool_calls = 0
     # logger.info(f"zzzzlog in customized generate {TOOL_CONFIGS["max_turns"]}")
     for turn in range(TOOL_CONFIGS["max_turns"]):
         results[turn] = {}
@@ -388,7 +319,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             results[turn]["ob"] = next_obs
             results[turn]["done"] = done
             break
-        elif turn == TOOL_CONFIGS["max_turns"] - 1:
+        elif turn < TOOL_CONFIGS["max_turns"] - 1:
             next_obs = f"<|im_start|>tools {next_obs} \n max amount of tool calls reached, think and give your answer. <|im_end|><|im_start|> assistant\n"
             results[turn]["ob"] = next_obs
             results[turn]["done"] = done
@@ -420,6 +351,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.response = response
     sample.loss_masks = loss_masks
     sample.response_actions = response_actions
+    sample.valid_tool_calls = response_actions.get("multi_code", 0)
 
     # Store payload information for wandb logging
     sample.payload_text = prompt + response
@@ -449,6 +381,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 def compute_score(
     solution_str: str,
     ground_truth: str,
+    valid_tool_call: int = 0,
     strict_box_verify: bool = False,
     pause_tokens_index: Optional[list[int]] = None,
 ) -> Union[float, Dict[str, Any]]:
@@ -476,6 +409,7 @@ def compute_score(
     correct = pred == ground_truth
 
     reward = 1.0 if correct else -1.0
+    reward += valid_tool_call * 0.1  # small bonus for each valid tool call
     # acc = correct
     result = {
         "score": reward,  # int
@@ -497,7 +431,7 @@ async def reward_func(args, sample, **kwargs):
     # Get ground truth answer - label is a string, not a dict
     ground_truth = sample.label if sample.label is not None else ""
     # use \\boxed{...} answer
-    result = compute_score(solution_str, ground_truth, strict_box_verify=True)
+    result = compute_score(solution_str, ground_truth, valid_tool_call=sample.valid_tool_calls, strict_box_verify=True)
     # logger.info(f"zzzzlog grading {result=}, on {solution_str[-100:]=} against {ground_truth=}")
 
     debug_dict = sample.debug_dict
