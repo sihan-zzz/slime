@@ -667,7 +667,12 @@ async def eval_rollout_single_dataset(
     global EVAL_PROMPT_DATASET
 
     store_raw_data = bool(getattr(args, "eval_scan_output_path", None))
-    cache_key = dataset_cfg.cache_key + (args.hf_checkpoint, args.apply_chat_template, store_raw_data)
+    cache_key = dataset_cfg.cache_key + (
+        args.hf_checkpoint,
+        args.apply_chat_template,
+        store_raw_data,
+        getattr(args, "disable_tool_use", False),
+    )
     if cache_key not in EVAL_PROMPT_DATASET:
         tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
@@ -683,6 +688,7 @@ async def eval_rollout_single_dataset(
             tool_key=dataset_cfg.tool_key,
             apply_chat_template=args.apply_chat_template,
             apply_chat_template_kwargs=args.apply_chat_template_kwargs,
+            disable_tool_use=getattr(args, "disable_tool_use", False),
             store_raw_data=store_raw_data,
         )
     dataset = EVAL_PROMPT_DATASET[cache_key]

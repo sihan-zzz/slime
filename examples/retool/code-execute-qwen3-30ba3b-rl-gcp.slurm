@@ -304,10 +304,8 @@ MISC_ARGS=(
    # --no-fp8-wgrad
    --attention-backend flash
 
-   # # for debug
-   # --no-gradient-accumulation-fusion
-   # --no-gradient-reduce-div-fusion
-   # --disable-tp-comm-bulk-wgrad
+   --no-check-for-nan-in-loss-and-grad 
+   --no_loss_on_truncated
 )
 
 CUSTOM_ARGS=(

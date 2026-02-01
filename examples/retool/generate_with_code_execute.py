@@ -45,6 +45,7 @@ When generating tool calls:
 - DO NOT use markdown fences (```)
 - Execution results will be returned within <interpreter></interpreter> XML tags.
 - The sandbox only returns stdout/stderr. Do not rely on REPL-style implicit output. If there is a final answer or variable to show, you MUST explicitly print it with print(...). 
+- You MUST call the tool at least once before giving the final answer.
 
 {%- endif %}
 <|im_end|>
@@ -72,14 +73,7 @@ def format_conversation_with_tools(
     if system_prompt:
         system_content = system_prompt
     else:
-        system_content = (
-            # "You are a program solution verifier that can verify whether a program is a correct solution to a coding problem. "
-            # " You are a generic verifier that can use Python "
-            # "tools to verify whether a solution is correct to a given math/coding question. "
-            # "When you need to perform calculations or execute code against test inputs, use the code_interpreter tool."
-            # "Don't fix the solution if it is wrong, just verify and give the final answer."
-            " You are an expert in mathematical verification."
-        )
+        system_content = "You are an expert mathematical verification assistant. "
 
     messages_to_render.append({"role": "system", "content": system_content})
 
@@ -216,12 +210,13 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     tool_call_count = 0  # Track actual tool call rounds
     output = None
     results = {"prompt": prompt, "index": sample.index}
+    last_round_response = ""
     # logger.info(f"zzzzlog in customized generate {TOOL_CONFIGS["max_turns"]}")
     for turn in range(TOOL_CONFIGS["max_turns"]):
         results[turn] = {}
 
         # BOB: hardcoded otherwise https will complain and have no fallback and will cause program to abort
-        ctx_len = 40959
+        ctx_len = 240959
         # if not ctx_len or ctx_len <= 0:
         #     ctx_len = getattr(state.tokenizer, "model_max_length", 40960)
 
@@ -239,6 +234,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         if current_sampling_params["max_new_tokens"] == 0:
             # No room to generate more tokens
             sample.status = Sample.Status.TRUNCATED
+            logger.info(
+                f"zzzzlog prompt exceeding max length, {sample.prompt[-100:]=}, {sample.metadata["_raw_data"]}"
+            )
             break
 
         # Simple: just send prompt + response
@@ -275,6 +273,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             loss_masks += [1] * len(cur_response_token_ids)
         results[turn]["finish_reason"] = output["meta_info"]["finish_reason"]["type"]
         # Check length limit
+        sample.last_round_response = cur_response
         if args.disable_tool_use:
             break
 
@@ -439,13 +438,15 @@ async def reward_func(args, sample, **kwargs):
 
     # Build complete solution string
     solution_str = sample.prompt + sample.response
-
+    last_round_response = sample.last_round_response if hasattr(sample, "last_round_response") else ""
     # Get ground truth answer - label is a string, not a dict
     ground_truth = sample.label if sample.label is not None else ""
     # use \\boxed{...} answer
-    result = compute_score(solution_str, ground_truth, valid_tool_call=sample.valid_tool_calls, strict_box_verify=True)
+    result = compute_score(
+        last_round_response, ground_truth, valid_tool_call=sample.valid_tool_calls, strict_box_verify=True
+    )
     logger.info(
-        f"zzzzlog grading {result=}, on {sample.valid_tool_calls=}, {solution_str[-100:]=} against {ground_truth=}"
+        f"zzzzlog grading {result=}, on {sample.valid_tool_calls=}, {last_round_response[-100:]=} against {ground_truth=}"
     )
 
     debug_dict = sample.debug_dict

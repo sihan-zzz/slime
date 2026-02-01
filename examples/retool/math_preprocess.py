@@ -7,6 +7,8 @@ import argparse
 import json
 from pathlib import Path
 
+from slime.utils.prompting import build_math_verification_user_prompt
+
 MATH_PROMPT_TEMPLATE = (
     "Here is a math problem and a solution. Think step by step and verify if the "
     "solution is correct to the problem. Use the provided tool if necessary.\n\n"
@@ -19,13 +21,10 @@ MATH_PROMPT_TEMPLATE = (
     "{answer}"
 )
 
-NEW_MATH_PROMPT_TEMPLATE = """
-    You are an expert in mathematical verification. You will be given a problem and a candidate solution. Please carefully analyze and determine whether the solution is correct.\nPlease analyze the logical reasoning at each step in natural language carefully, use Python interpreter to verify the correctness of each computation, and synthesize your findings to reach a conclusion.
-    **Problem**\n
-    \n{prompt}\n
-    **Solution**\n{candidate_solution}\n
-    Please output your final answer in \\boxed{{}} as either 1 for correct solution or 0 for incorrect solution, e.g., \\boxed{{1}}.
-    """
+NEW_MATH_PROMPT_TEMPLATE = build_math_verification_user_prompt(
+    problem="{prompt}",
+    candidate_solution="{candidate_solution}",
+)
 
 
 def parse_args() -> argparse.Namespace:

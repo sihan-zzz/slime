@@ -8,6 +8,8 @@ import re
 import numpy as np
 import ray
 
+from slime.utils.prompting import build_math_verification_user_prompt
+
 try:
     import pyarrow.parquet as pq
 except ImportError:
@@ -166,6 +168,7 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
 
 
 class Dataset:
+
     def __init__(
         self,
         path,
@@ -181,11 +184,27 @@ class Dataset:
         seed=42,
         apply_chat_template=False,
         apply_chat_template_kwargs=None,
+        disable_tool_use=False,
         store_raw_data=False,
         raw_data_key="_raw_data",
     ):
+
+        store_raw_data = True
+        raw_data_key = "_raw_data"
         origin_samples = []
         for data in read_file(path):
+            if (prompt_key not in data or data.get(prompt_key) is None) and "question" in data and "answer" in data:
+                data = dict(data)
+                data[prompt_key] = [
+                    {
+                        "role": "user",
+                        "content": build_math_verification_user_prompt(
+                            problem=data["question"],
+                            candidate_solution=data["answer"],
+                            require_tool=not disable_tool_use,
+                        ),
+                    }
+                ]
             # Both chat templates and multimodal inputs require conversation format (list of message dicts)
             as_conversation = apply_chat_template or (multimodal_keys is not None)
             prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
@@ -194,7 +213,7 @@ class Dataset:
             if store_raw_data:
                 if not isinstance(metadata, dict):
                     metadata = {}
-                metadata[raw_data_key] = data
+                metadata[raw_data_key] = {k: v for k, v in data.items() if k not in {"prompt"}}
             tools = None
             if tool_key is not None and tool_key in data:
                 tools = data[tool_key]
