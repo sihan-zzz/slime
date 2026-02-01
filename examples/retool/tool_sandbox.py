@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Tool sandbox module for safe code execution and tool management.
 
@@ -8,9 +9,11 @@ This module provides:
 """
 
 import asyncio
+import ast
 import gc
 import os
 import re
+import sys
 import subprocess
 import tempfile
 from contextlib import contextmanager
@@ -20,9 +23,9 @@ import psutil
 
 # Configuration for tool execution
 TOOL_CONFIGS = {
-    "max_turns": int(os.getenv("MAX_TURNS", 4)),
+    "max_turns": int(os.getenv("MAX_TURNS", 10)),
     # "max_tool_calls": int(os.getenv("MAX_TOOL_CALLS", 4)),
-    "max_tool_calls_per_turn": int(os.getenv("MAX_TOOL_CALLS_PER_TURN", 4)), # Limit tool calls per turn
+    "max_tool_calls_per_turn": int(os.getenv("MAX_TOOL_CALLS_PER_TURN", 4)),  # Limit tool calls per turn
     "tool_concurrency": 32,  # Aggressive: 32 concurrent processes
     # Python interpreter settings
     "python_timeout": 5,  # 5 seconds per code execution
@@ -157,6 +160,33 @@ class PythonSandbox:
 
         return True, "Code is safe"
 
+    def _ensure_last_expr_print(self, code: str) -> str:
+        """If the last statement is an expression, wrap it in print()."""
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return code
+
+        if not tree.body:
+            return code
+
+        last_stmt = tree.body[-1]
+        if isinstance(last_stmt, ast.Expr):
+            tree.body[-1] = ast.Expr(
+                value=ast.Call(
+                    func=ast.Name(id="print", ctx=ast.Load()),
+                    args=[last_stmt.value],
+                    keywords=[],
+                )
+            )
+            ast.fix_missing_locations(tree)
+            try:
+                return ast.unparse(tree)
+            except Exception:
+                return code
+
+        return code
+
     @contextmanager
     def _create_safe_environment(self):
         """Create safe execution environment with temporary directory"""
@@ -190,6 +220,8 @@ class PythonSandbox:
         if current_memory > TOOL_CONFIGS["max_memory_usage"]:
             aggressive_cleanup_memory()
             return "Error: Memory usage too high, please try again"
+
+        code = self._ensure_last_expr_print(code)
 
         # Check code safety
         is_safe, message = self._check_code_safety(code)
@@ -361,3 +393,58 @@ class ToolRegistry:
 
 # Global tool registry instance
 tool_registry = ToolRegistry()
+
+
+TEST_CODE = """
+from sympy import symbols, solve, sqrt
+
+# Define the variable t
+t = symbols('t')
+
+# Equation: 4t^2 + 2t - 101 = 0
+solution = solve(4*t**2 + 2*t - 101, t)
+
+# Filter the positive solution
+positive_solution = [sol.evalf() for sol in solution if sol.evalf() > 0][0]
+
+# Calculate the expression (9*sqrt(5) - 1)/4
+expression = (9*sqrt(5) - 1)/4
+
+# Check if the solution matches the expression
+is_correct = (positive_solution == expression.evalf())
+
+is_correct
+"""
+
+
+async def _run_from_cli() -> int:
+    """Run the sandbox from CLI with a code string argument or stdin."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Execute Python code in the sandbox.",
+    )
+    parser.add_argument(
+        "code",
+        nargs="?",
+        help="Python code string to execute. If omitted, read from stdin.",
+    )
+    parser.add_argument(
+        "--stdin",
+        default=None,
+        help='Optional stdin to pass to the code. Use "" for a blank line.',
+    )
+    args = parser.parse_args()
+
+    code = TEST_CODE
+    if not code.strip():
+        print("Error: No code provided", file=sys.stderr)
+        return 1
+
+    result = await tool_registry._execute_python({"code": code, "stdin": args.stdin})
+    print(result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(_run_from_cli()))

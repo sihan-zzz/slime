@@ -200,11 +200,11 @@ EOF
 MOUNT_DIR="/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/slime"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${MOUNT_DIR}/qwen3_30b_a3b
-   --ref-load ${MOUNT_DIR}/qwen3_30b_a3b_torch_dist
+   --hf-checkpoint ${MOUNT_DIR}/qwen3_30b_a3b_2507
+   --ref-load ${MOUNT_DIR}/qwen3_30b_a3b_2507_torch_dist
    --save ${MOUNT_DIR}/qwen3-30b-rl-multi-turn/${UNIQUE_JOB_NAME}
    --save-interval 20
-   --rotary-base 1000000
+   --rotary-base 10000000
 )
 
 export NUM_ROLLOUT=${NUM_ROLLOUT:-500}

@@ -20,14 +20,11 @@ MATH_PROMPT_TEMPLATE = (
 )
 
 NEW_MATH_PROMPT_TEMPLATE = """
-    Your task is to analyze a mathematical solution step-by-step and determine if it is correct.
-    Input:
-    - Problem: "{prompt}"
-    - Model Solution: "{answer}"
-    Output:
-    1. First, provide a detailed step-by-step analysis of the model solution. For each step, explain what is being done and why.
-    2. After the analysis, conclude with a final verdict in the form: \n Answer: \\boxed{{$Answer}} \n
-       where $Answer is 1 if the solution is correct and 0 if it is incorrect.
+    You are an expert in mathematical verification. You will be given a problem and a candidate solution. Please carefully analyze and determine whether the solution is correct.\nPlease analyze the logical reasoning at each step in natural language carefully, use Python interpreter to verify the correctness of each computation, and synthesize your findings to reach a conclusion.
+    **Problem**\n
+    \n{prompt}\n
+    **Solution**\n{candidate_solution}\n
+    Please output your final answer in \\boxed{{}} as either 1 for correct solution or 0 for incorrect solution, e.g., \\boxed{{1}}.
     """
 
 
@@ -58,23 +55,26 @@ def build_default_output_path(input_path: Path) -> Path:
 
 
 def transform_record(row: dict) -> dict:
-    original_prompt = row.get("prompt")
-    if original_prompt is None:
-        raise ValueError("Row missing 'prompt' field.")
+    # original_prompt = row.get("prompt")
+    # if original_prompt is None:
+    #     raise ValueError("Row missing 'prompt' field.")
     answer = row.get("answer")
     if answer is None:
         raise ValueError("Row missing 'answer' field.")
 
-    row["question"] = original_prompt
+    # row["question"] = original_prompt
+    # print(row["question"])
     row["prompt"] = [
         {
             "role": "user",
-            "content": MATH_PROMPT_TEMPLATE.format(
-                prompt=original_prompt,
-                answer=answer,
+            "content": NEW_MATH_PROMPT_TEMPLATE.format(
+                prompt=row["question"],
+                candidate_solution=row["answer"],
             ),
         }
     ]
+    # print(row["prompt"])
+    # 1 / 0
     return row
 
 
@@ -99,9 +99,11 @@ def main() -> None:
                 continue
             row = json.loads(line)
             transformed = transform_record(row)
+            # print(transformed)
             writer.write(json.dumps(transformed, ensure_ascii=False))
             writer.write("\n")
             count += 1
+            # break
 
     print(f"Wrote {count} rows to {output_path}")
 

@@ -127,6 +127,12 @@ def add_custom_args(parser):
         help="Write eval-scan filtered prompts to this jsonl path when a custom eval log hook is enabled.",
     )
     parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help="The system prompt to use for the model.",
+    )
+    parser.add_argument(
         "--eval-scan-min-correct",
         type=int,
         default=None,
@@ -136,6 +142,11 @@ def add_custom_args(parser):
         "--eval-scan-overwrite",
         action="store_true",
         help="Overwrite eval-scan output file on rollout_id==0.",
+    )
+    parser.add_argument(
+        "--disable-tool-use",
+        action="store_true",
+        help="Disable the use of tools.",
     )
     return parser
 

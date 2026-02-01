@@ -34,18 +34,17 @@ You are a helpful assistant.
 {%- if tools %}
 # Tools
 
-To use python execution env, return a json object with function name and arguments 
+You are given the python interpreter tool. To use it, return a json object with function name and arguments 
 within <tool_call></tool_call> XML tags:
 <tool_call>
 {"name":"code_interpreter","arguments":{"code":"print(1+1)","stdin":""}}
 </tool_call>
-This is a standard python env without third-party libraries or internet access. 
+This is a standard non-interactive python sandbox env without third-party libraries or internet access. 
 When generating tool calls:
 - The "code" field MUST contain raw python code only.
-- DO NOT use markdown fences (```).
-- DO NOT add backticks.
-- Only plain python text.
-Execution results will be returned within <interpreter></interpreter> XML tags.
+- DO NOT use markdown fences (```)
+- Execution results will be returned within <interpreter></interpreter> XML tags.
+- The sandbox only returns stdout/stderr. Do not rely on REPL-style implicit output. If there is a final answer or variable to show, you MUST explicitly print it with print(...). 
 
 {%- endif %}
 <|im_end|>
@@ -75,10 +74,11 @@ def format_conversation_with_tools(
     else:
         system_content = (
             # "You are a program solution verifier that can verify whether a program is a correct solution to a coding problem. "
-            " You are a generic verifier that can use Python "
-            "tools to verify whether a solution is correct to a given math/coding question. "
-            "When you need to perform calculations or execute code against test inputs, use the code_interpreter tool."
-            "Don't fix the solution if it is wrong, just verify and give the final answer."
+            # " You are a generic verifier that can use Python "
+            # "tools to verify whether a solution is correct to a given math/coding question. "
+            # "When you need to perform calculations or execute code against test inputs, use the code_interpreter tool."
+            # "Don't fix the solution if it is wrong, just verify and give the final answer."
+            " You are an expert in mathematical verification."
         )
 
     messages_to_render.append({"role": "system", "content": system_content})
@@ -140,9 +140,9 @@ def postprocess_predictions(
         elif parsing_error is not None:
             return "invalid_tool_calls", parsing_error
         else:
-            return "no_tool_calls", "Empty code in tool calls"
+            return "tool_call_no_code", ""
     else:
-        action = "no_tool_calls_nor_answer"
+        action = "no_tool_call_nor_answer"
         # Otherwise, fall through
 
     return action, ""
@@ -152,6 +152,7 @@ async def execute_predictions(prediction: str, max_tools_calls_per_turn=4) -> st
     """Execute predictions and return results"""
     action, content = postprocess_predictions(prediction)
 
+    code_inputs = []
     if action == "multi_code":
         # only execute up to max_tools_calls_per_turn
         results = []
@@ -166,6 +167,7 @@ async def execute_predictions(prediction: str, max_tools_calls_per_turn=4) -> st
                         args = {"code": code}
                         if stdin_value is not None:
                             args["stdin"] = stdin_value
+                        code_inputs.append(args)
                         result = await tool_registry.execute_tool("code_interpreter", args)
                     results.append(f"<interpreter>\n{result}\n</interpreter>")
                 else:
@@ -178,26 +180,16 @@ async def execute_predictions(prediction: str, max_tools_calls_per_turn=4) -> st
     elif action == "invalid_tool_calls":
         next_obs = content
         done = False
-    elif action == "no_tool_calls":
-        next_obs = (
-            "\nYour previous action did not contain any valid tool calls or final answer. "
-            "If You want to execute code, you should put the code between "
-            "<tool_call> and </tool_call>. "
-            "If You want to give the final answer, you should use the format "
-            "'Answer: \\boxed{answer}'. Try again.\n"
-        )
+    elif action == "tool_call_no_code":
+        next_obs = "\nNo code found in tool_call."
+        done = False
+    elif action == "no_tool_call_nor_answer":
+        next_obs = "\nNo tool_call nor answer found in the response."
         done = False
     else:
-        next_obs = (
-            "\nYour previous action is invalid. "
-            "If You want to execute code, you should put the code between "
-            "<tool_call> and </tool_call>. "
-            "If You want to give the final answer, you should use the format "
-            "'Answer: \\boxed{answer}'. Try again.\n"
-        )
-        done = False
+        raise Exception("Not recogenized action")
 
-    return next_obs, done, action
+    return next_obs, done, action, code_inputs
 
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
@@ -212,7 +204,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
     # Set up the initial prompt with system prompt and tools (outside the loop)
     tool_specs = tool_registry.get_tool_specs()
-    prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
+    prompt = format_conversation_with_tools(
+        prompt=sample.prompt, tools=tool_specs if not args.disable_tool_use else []
+    )
     prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
     response = ""
     response_token_ids = []
@@ -222,7 +216,6 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     tool_call_count = 0  # Track actual tool call rounds
     output = None
     results = {"prompt": prompt, "index": sample.index}
-    valid_tool_calls = 0
     # logger.info(f"zzzzlog in customized generate {TOOL_CONFIGS["max_turns"]}")
     for turn in range(TOOL_CONFIGS["max_turns"]):
         results[turn] = {}
@@ -255,25 +248,6 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             "return_logprob": True,
         }
 
-        # Log payload to wandb for debugging
-        try:
-            import wandb
-
-            if wandb.run is not None:
-                # Count tools used in the current response
-                tools_used = response.count("<interpreter>")
-
-                wandb.log(
-                    {
-                        "debug/payload_length": len(current_token_ids),
-                        "debug/num_token": len(current_token_ids),
-                        "debug/tools_used": tools_used,
-                        "debug/turn": turn,
-                    }
-                )
-        except ImportError:
-            pass  # wandb not available
-
         output = await post(url, payload)
 
         # Handle abort
@@ -301,11 +275,16 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             loss_masks += [1] * len(cur_response_token_ids)
         results[turn]["finish_reason"] = output["meta_info"]["finish_reason"]["type"]
         # Check length limit
+        if args.disable_tool_use:
+            break
+
         if output["meta_info"]["finish_reason"]["type"] == "length":
             break
-        next_obs, done, action = await execute_predictions(
+
+        next_obs, done, action, code_inputs = await execute_predictions(
             cur_response, max_tools_calls_per_turn=TOOL_CONFIGS["max_tool_calls_per_turn"]
         )
+        results[turn]["code_inputs"] = code_inputs
         if next_obs is None:
             next_obs = ""
             logger.info(
@@ -319,21 +298,37 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             results[turn]["ob"] = next_obs
             results[turn]["done"] = done
             break
-        elif turn < TOOL_CONFIGS["max_turns"] - 1:
-            next_obs = f"<|im_start|>tools {next_obs} \n max amount of tool calls reached, think and give your answer. <|im_end|><|im_start|> assistant\n"
-            results[turn]["ob"] = next_obs
-            results[turn]["done"] = done
-        else:
-            next_obs = f"<|im_start|>tools {next_obs} \n given above tool call results, think and decide if you need to call any tools or give answer directly. <|im_end|><|im_start|> assistant\n"
-            results[turn]["ob"] = next_obs
-            results[turn]["done"] = done
+        elif turn == TOOL_CONFIGS["max_turns"] - 2:
+            assistant_msg = (
+                "The maximum number of tool calls has been reached.\n"
+                "Do not make any further tool calls. Think through the problem using the information\n"
+                "already available, then output your answer in the format \\boxed{0} or \\boxed{1}, where:\n"
+                "1 means the solution is correct;\n"
+                "0 means the solution is incorrect.\n"
+            )
+        elif turn < TOOL_CONFIGS["max_turns"] - 2:
+            assistant_msg = (
+                "Analyze the Python execution results shown above.\n"
+                "Compare them carefully with the original question and the proposed solution.\n"
+                "Determine whether the solution is correct.\n"
+                "If the results are sufficient to decide, output your answer in the format \\boxed{0} or \\boxed{1}, where:\n"
+                "1 means the solution is correct;\n"
+                "0 means the solution is incorrect.\n"
+                "If the results are not sufficient to decide, make another appropriate tool call instead of giving the boxed answer.\n"
+            )
+        else:  # turn == TOOL_CONFIGS["max_turns"] - 1
+            next_obs = ""
+            done = True
+        if not done:
+            next_obs = f"<|im_start|>tools\n{next_obs}\n<|im_end|>\n<|im_start|>assistant\n{assistant_msg}"
+        results[turn]["ob"] = next_obs
+        results[turn]["done"] = done
 
         # Count tool calls (when we get interpreter output, it means a tool
         # was called)
         if "<interpreter>" in next_obs:
             tool_call_count += 1
         results[turn]["tool_call_count"] = tool_call_count
-        assert next_obs != "", "Next observation should not be empty."
         obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
         response += next_obs
         response_token_ids += obs_tokens_ids
@@ -362,6 +357,23 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.tool_call_count = tool_call_count
     sample.turn_finished = turn + 1
 
+    # Log payload to wandb for debugging
+    try:
+        import wandb
+
+        if wandb.run is not None:
+
+            wandb.log(
+                {
+                    "debug/prompt_len": len(prompt_tokens_ids),
+                    "debug/total_response_len": len(response_token_ids),
+                    "debug/valid_response_len": sum(loss_masks),
+                    "debug/tools_used": tool_call_count,
+                    "debug/turns": sample.turn_finished,
+                }
+            )
+    except ImportError:
+        pass  # wandb not available
     if output is None:
         return sample
 
@@ -432,7 +444,9 @@ async def reward_func(args, sample, **kwargs):
     ground_truth = sample.label if sample.label is not None else ""
     # use \\boxed{...} answer
     result = compute_score(solution_str, ground_truth, valid_tool_call=sample.valid_tool_calls, strict_box_verify=True)
-    # logger.info(f"zzzzlog grading {result=}, on {solution_str[-100:]=} against {ground_truth=}")
+    logger.info(
+        f"zzzzlog grading {result=}, on {sample.valid_tool_calls=}, {solution_str[-100:]=} against {ground_truth=}"
+    )
 
     debug_dict = sample.debug_dict
     if debug_dict is not None:
