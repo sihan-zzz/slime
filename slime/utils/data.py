@@ -8,7 +8,7 @@ import re
 import numpy as np
 import ray
 
-from slime.utils.prompting import build_math_verification_user_prompt
+from slime.utils.prompting import build_code_verification_user_prompt, build_math_verification_user_prompt
 
 try:
     import pyarrow.parquet as pq
@@ -167,6 +167,17 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
     return prompt
 
 
+def _resolve_prompt_template_type(dataset_name: str | None, data: dict) -> str:
+    name = (dataset_name or "").strip().lower()
+    if "code" in name:
+        return "code"
+    if "math" in name:
+        return "math"
+    if "program" in data:
+        return "code"
+    return "math"
+
+
 class Dataset:
 
     def __init__(
@@ -176,6 +187,7 @@ class Dataset:
         processor,
         max_length,
         *,
+        dataset_name=None,
         prompt_key="text",
         multimodal_keys=None,
         label_key=None,
@@ -193,27 +205,52 @@ class Dataset:
         raw_data_key = "_raw_data"
         origin_samples = []
         for data in read_file(path):
-            if (prompt_key not in data or data.get(prompt_key) is None) and "question" in data and "answer" in data:
-                data = dict(data)
-                data[prompt_key] = [
-                    {
-                        "role": "user",
-                        "content": build_math_verification_user_prompt(
-                            problem=data["question"],
-                            candidate_solution=data["answer"],
-                            require_tool=not disable_tool_use,
-                        ),
-                    }
-                ]
-            # Both chat templates and multimodal inputs require conversation format (list of message dicts)
-            as_conversation = apply_chat_template or (multimodal_keys is not None)
-            prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
 
             metadata = data.get(metadata_key) or {}
             if store_raw_data:
                 if not isinstance(metadata, dict):
                     metadata = {}
-                metadata[raw_data_key] = {k: v for k, v in data.items() if k not in {"prompt"}}
+                metadata[raw_data_key] = {k: v for k, v in data.items()}
+
+            template_type = _resolve_prompt_template_type(dataset_name, data)
+            data = dict(data)
+            if template_type == "code":
+                problem = data.get("question", data.get("prompt"))
+                candidate_solution = data.get("program", data.get("answer"))
+                if problem is not None and candidate_solution is not None:
+                    data[prompt_key] = [
+                        {
+                            "role": "user",
+                            "content": build_code_verification_user_prompt(
+                                problem=problem,
+                                candidate_solution=candidate_solution,
+                                require_tool=not disable_tool_use,
+                            ),
+                        }
+                    ]
+            else:
+                problem = data.get("question", data.get("prompt"))
+                candidate_solution = data.get("answer")
+                if problem is not None and candidate_solution is not None:
+                    data[prompt_key] = [
+                        {
+                            "role": "user",
+                            "content": build_math_verification_user_prompt(
+                                problem=problem,
+                                candidate_solution=candidate_solution,
+                                require_tool=not disable_tool_use,
+                            ),
+                        }
+                    ]
+
+            if prompt_key not in data or data.get(prompt_key) is None:
+                raise ValueError(
+                    f"Unable to construct prompt using prompt_key='{prompt_key}' for dataset '{dataset_name}' at path '{path}'."
+                )
+            # Both chat templates and multimodal inputs require conversation format (list of message dicts)
+            as_conversation = apply_chat_template or (multimodal_keys is not None)
+            prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
+
             tools = None
             if tool_key is not None and tool_key in data:
                 tools = data[tool_key]
@@ -262,6 +299,8 @@ class Dataset:
         self.epoch_id = -1
         self.seed = seed
         self.samples = self.origin_samples
+        logger.info("zzzzlog Loaded %d samples from path '%s' for dataset '%s'", len(self.samples), path, dataset_name)
+        logger.info("zzzzlog sample prompt example: %s", self.samples[0] if self.samples else "N/A")
 
     def shuffle(self, new_epoch_id):
         if self.epoch_id == new_epoch_id:

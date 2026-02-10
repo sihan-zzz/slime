@@ -210,9 +210,11 @@ CKPT_ARGS=(
 export NUM_ROLLOUT=${NUM_ROLLOUT:-500}
 
 export TRAIN_DATA=${TRAIN_DATA:-${MOUNT_DIR}/data/APPS-dataset/APPS-synthetic-train.jsonl}
+export MATH_DATA=${MATH_DATA:-${MOUNT_DIR}/data/math/5_mathematical_processed_data_prompt.jsonl}
 export EVAL_DATA=${EVAL_DATA:-${MOUNT_DIR}/data/APPS-dataset/APPS-synthetic-test.jsonl}
 ROLLOUT_ARGS=(
-   --prompt-data $TRAIN_DATA
+   --rollout-prompt-data code $TRAIN_DATA math $MATH_DATA
+   --rollout-samples-per-dataset 16
    --input-key prompt
    --label-key label
    --apply-chat-template
@@ -221,7 +223,7 @@ ROLLOUT_ARGS=(
    --num-rollout ${NUM_ROLLOUT}
    --rollout-batch-size 32
    --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
+   --rollout-max-response-len 16384
    --rollout-temperature 0.6
    --rollout-top-p 0.95
    --rollout-top-k 20
@@ -236,7 +238,7 @@ EVAL_ARGS=(
    --eval-interval 20
    --eval-prompt-data ${EVAL_DATA}
    --n-samples-per-eval-prompt 1
-   --eval-max-response-len 8192
+   --eval-max-response-len 16384
    --eval-temperature 0.6
    --eval-top-p 0.95
    --eval-top-k 20
@@ -249,9 +251,9 @@ PERF_ARGS=(
    --context-parallel-size 1
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
-   # --recompute-granularity full
-   # --recompute-method uniform
-   # --recompute-num-layers 1
+   --recompute-granularity full
+   --recompute-method uniform
+   --recompute-num-layers 1
    --use-dynamic-batch-size
    --max-tokens-per-gpu 65536
 )
@@ -269,7 +271,7 @@ GRPO_ARGS=(
 OPTIMIZER_ARGS=(
    --optimizer adam
    --lr 1e-6
-   --lr-decay-style cosine
+   --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
@@ -285,6 +287,7 @@ WANDB_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.9
+   --sglang-allow-auto-truncate
 )
 
 MISC_ARGS=(
@@ -292,8 +295,10 @@ MISC_ARGS=(
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
-   --no-fp8-wgrad
+   # --no-fp8-wgrad
    --attention-backend flash
+   --no-check-for-nan-in-loss-and-grad 
+   --no_loss_on_truncated
 
    # # for debug
    # --no-gradient-accumulation-fusion

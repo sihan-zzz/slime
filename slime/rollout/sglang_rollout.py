@@ -681,6 +681,7 @@ async def eval_rollout_single_dataset(
             tokenizer=tokenizer,
             processor=processor,
             max_length=args.eval_max_prompt_len,
+            dataset_name=dataset_cfg.name,
             prompt_key=dataset_cfg.input_key,
             label_key=dataset_cfg.label_key,
             multimodal_keys=args.multimodal_keys,
@@ -810,6 +811,7 @@ async def eval_rollout_single_dataset(
             return
 
         selected: list[dict[str, Any]] = []
+        all_rows: list[dict[str, Any]] = []
         to_handle = list(eval_scan_pending_groups)
         for group_idx in to_handle:
             stats = eval_scan_group_stats.get(group_idx)
@@ -823,8 +825,6 @@ async def eval_rollout_single_dataset(
             eval_scan_handled_groups.add(group_idx)
 
             correct_count = int(stats["correct_count"])
-            if correct_count >= int(eval_scan_min_correct):
-                continue
 
             raw_sample = stats["raw_sample"]
             if raw_sample is None:
@@ -838,16 +838,19 @@ async def eval_rollout_single_dataset(
                 raw_sample = dict(raw_sample)
                 raw_sample["correct_count"] = correct_count
                 raw_sample["total_count"] = int(stats["total_count"])
-                selected.append(raw_sample)
+                all_rows.append(raw_sample)
+                if correct_count < int(eval_scan_min_correct):
+                    selected.append(raw_sample)
 
-        if selected:
+        if all_rows:
             mode = "a"
             if not eval_scan_initialized and rollout_id == 0 and getattr(args, "eval_scan_overwrite", False):
                 mode = "w"
             with open(eval_scan_output_path, mode) as f:
-                for item in selected:
+                for item in all_rows:
                     f.write(json.dumps(item, ensure_ascii=True) + "\n")
             eval_scan_initialized = True
+        if selected:
             eval_scan_selected_count += len(selected)
 
     # do multiple samples for eval prompts

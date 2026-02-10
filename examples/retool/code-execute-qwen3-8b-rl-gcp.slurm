@@ -232,10 +232,6 @@ ROLLOUT_ARGS=(
    --global-batch-size 256
    --balance-data
    --rollout-num-gpus $((8 * $ROLLOUT_NODES))
-   # --rollout-temperature 1.0 
-   # --rollout-temperature-anneal-style cosine 
-   # --rollout-temperature-anneal-end 0.6 
-   # --rollout-temperature-anneal-steps 200
 )
 
 EVAL_ARGS=(
@@ -291,6 +287,7 @@ WANDB_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.9
+   --sglang-allow-auto-truncate
 )
 
 MISC_ARGS=(
@@ -300,6 +297,8 @@ MISC_ARGS=(
    --attention-softmax-in-fp32
    --no-fp8-wgrad
    --attention-backend flash
+   --no-check-for-nan-in-loss-and-grad 
+   --no_loss_on_truncated
 
    # # for debug
    # --no-gradient-accumulation-fusion
