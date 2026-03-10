@@ -4,7 +4,7 @@
 #SBATCH --exclusive
 #SBATCH --ntasks-per-node=1            # one launcher per node (procid 0..N-1)
 #SBATCH --gpus-per-node=8              # GPUs per node
-#SBATCH --account=cpt
+#SBATCH --account=ads_cpt
 #SBATCH --cpus-per-task=224
 #SBATCH --mem=3588G
 #SBATCH --exclude=metavmds1-a4-[0]
