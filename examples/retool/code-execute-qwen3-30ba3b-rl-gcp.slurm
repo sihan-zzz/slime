@@ -309,8 +309,8 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   --custom-generate-function-path generate_with_code_execute.generate
-   --custom-rm-path generate_with_code_execute.reward_func
+   --custom-generate-function-path generate_with_native_tools.generate
+   --custom-rm-path generate_with_native_tools.reward_func
    --rollout-health-check-timeout 45
 )
 
