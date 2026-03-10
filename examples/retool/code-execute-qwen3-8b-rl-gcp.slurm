@@ -18,6 +18,12 @@
 
 set -ex
 
+# --- activate micromamba slime env ---
+export MAMBA_EXE='/home/sihanzeng_meta_com/.local/bin/micromamba'
+export MAMBA_ROOT_PREFIX='/home/sihanzeng_meta_com/micromamba'
+eval "$($MAMBA_EXE shell hook --shell bash --root-prefix $MAMBA_ROOT_PREFIX 2>/dev/null)"
+micromamba activate slime
+
 # --- user tweakables ---
 GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-8}}  # fallback if your cluster exposes env var differently
 export GPUS_PER_NODE
