@@ -54,6 +54,48 @@ def build_initial_prompt(tokenizer, user_prompt: str, use_tools: bool, system_pr
     )
 
 
+def _try_parse_tool_call(json_str: str) -> dict | None:
+    """Try to parse a tool call JSON string, with fallback for markdown fences and escape issues.
+
+    Instruct models sometimes wrap code in ```py...``` fences or produce escaping issues
+    inside the JSON code field. This function tries standard JSON parse first, then falls back
+    to regex extraction of the code field.
+    """
+    # Attempt 1: standard JSON parse (handles well-formed tool calls)
+    try:
+        clean = json_str.replace("\n", "\\n")
+        data = json.loads(clean)
+        if data.get("name") == "code_interpreter":
+            code = data.get("arguments", {}).get("code", "").strip()
+            if code:
+                # Strip markdown fences if present in parsed code
+                code = re.sub(r"^```(?:py|python)?\n?", "", code)
+                code = re.sub(r"\n?```$", "", code)
+                return {
+                    "code": code.strip(),
+                    "stdin": data["arguments"].get("stdin", data["arguments"].get("input", None)),
+                }
+    except (json.JSONDecodeError, KeyError, AttributeError):
+        pass
+
+    # Attempt 2: regex extraction when JSON parsing fails (markdown fences, escape issues)
+    # Extract code value directly from the raw string
+    code_match = re.search(
+        r'"code"\s*:\s*"(```(?:py|python)?\s*\n)?(.*?)(\n?```)?"\s*[,}]',
+        json_str,
+        re.DOTALL,
+    )
+    if code_match:
+        code = code_match.group(2).strip()
+        if code:
+            # Unescape common JSON escape sequences
+            code = code.replace("\\n", "\n").replace('\\"', '"').replace("\\'", "'").replace("\\\\", "\\")
+            return {"code": code, "stdin": None}
+
+    logger.error(f"Tool call parse error (all attempts failed), json_str={json_str[:200]!r}...")
+    return None
+
+
 def parse_response(prediction: str) -> tuple[str, Any]:
     """Parse model response for tool calls or boxed answers.
 
@@ -76,20 +118,9 @@ def parse_response(prediction: str) -> tuple[str, Any]:
 
     results = []
     for json_str in tool_call_matches:
-        try:
-            json_str = json_str.replace("\n", "\\n")
-            data = json.loads(json_str)
-            if data.get("name") == "code_interpreter":
-                args = data.get("arguments", {})
-                code = args.get("code", "").strip()
-                if code:
-                    results.append({
-                        "code": code,
-                        "stdin": args.get("stdin", args.get("input", None)),
-                    })
-        except (json.JSONDecodeError, KeyError, AttributeError) as e:
-            logger.error(f"Tool call parse error: {e}, json_str={json_str!r}")
-            continue
+        parsed = _try_parse_tool_call(json_str)
+        if parsed:
+            results.append(parsed)
 
     if results:
         return "tool_calls", results

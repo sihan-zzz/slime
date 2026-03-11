@@ -229,7 +229,7 @@ ROLLOUT_ARGS=(
    --num-rollout ${NUM_ROLLOUT}
    --rollout-batch-size 32
    --n-samples-per-prompt 8
-   --rollout-max-response-len 16384
+   --rollout-max-response-len 24576
    --rollout-temperature 0.6
    --rollout-top-p 0.95
    --rollout-top-k 20
@@ -248,7 +248,7 @@ EVAL_ARGS=(
    --eval-interval 20
    --eval-prompt-data ${EVAL_DATA}
    --n-samples-per-eval-prompt 1
-   --eval-max-response-len 16384
+   --eval-max-response-len 24576
    --eval-temperature 0.6
    --eval-top-p 0.95
    --eval-top-k 20
