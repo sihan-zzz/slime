@@ -172,11 +172,14 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     loss_mask = []
     response_text = ""
     tool_call_rounds = 0
+    consecutive_failures = 0
+    max_consecutive_failures = int(os.getenv("MAX_CONSECUTIVE_TOOL_FAILURES", 2))
     action_counts = {}
     debug = {"prompt": prompt, "index": sample.index}
 
     max_turns = TOOL_CONFIGS["max_turns"]
     ctx_len = 240959  # hardcoded to avoid sglang health-check errors
+    force_final_answer = False  # set after consecutive tool call failures
 
     for turn in range(max_turns):
         debug[turn] = {}
@@ -236,6 +239,10 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         if is_truncated:
             break
 
+        # If we forced the model to give a final answer last turn, stop now
+        if force_final_answer:
+            break
+
         # Parse response
         action, content = parse_response(cur_text)
         action_counts[action] = action_counts.get(action, 0) + 1
@@ -245,6 +252,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             break
 
         if action == "tool_calls":
+            consecutive_failures = 0  # reset on success
             # Execute tool calls
             tool_output, num_executed = await execute_tool_calls(
                 content, max_per_turn=TOOL_CONFIGS["max_tool_calls_per_turn"]
@@ -269,12 +277,27 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             # Last turn: no more tool calls possible
             break
         else:
-            # No valid tool call or answer — append error feedback
-            if action == "invalid":
-                error_text = f"\n{content}\n"
+            # No valid tool call or answer
+            consecutive_failures += 1
+
+            if consecutive_failures >= max_consecutive_failures:
+                # Too many consecutive failures — force final answer on next turn
+                logger.info(
+                    f"Early exit: {consecutive_failures} consecutive tool call failures, "
+                    f"index={sample.index}, turn={turn}"
+                )
+                obs = format_tool_response(
+                    "\nTool calling failed. Please provide your final answer as \\boxed{0} or \\boxed{1}.\n"
+                )
+                obs = obs.rstrip("\n") + "\n" + FINAL_TURN_INSTRUCTION + "\n"
+                force_final_answer = True  # will break after next generation
             else:
-                error_text = "\nNo tool call or answer found. Please make a tool call or provide your answer as \\boxed{{0}} or \\boxed{{1}}.\n"
-            obs = format_tool_response(error_text)
+                # Give feedback and let model retry once
+                if action == "invalid":
+                    error_text = f"\n{content}\n"
+                else:
+                    error_text = "\nNo tool call or answer found. Please make a tool call or provide your answer as \\boxed{{0}} or \\boxed{{1}}.\n"
+                obs = format_tool_response(error_text)
 
         # Tokenize observation (tool response turn) — these are environment tokens
         obs_token_ids = state.tokenizer(obs, add_special_tokens=False)["input_ids"]
